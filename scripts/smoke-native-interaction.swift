@@ -42,6 +42,9 @@ final class MockController: @unchecked Sendable {
                     }
                     let input = try! JSONSerialization.jsonObject(with: body) as! [String: Any]
                     if let mode = input["mode"] { state["mode"] = mode }
+                    var settings = state["settings"] as? [String: Any] ?? [:]
+                    for (key, value) in input { settings[key] = value }
+                    state["settings"] = settings
                     return (Data("{\"ok\":true}".utf8), 200, 0.15)
                 }
                 actionStarts.append((path, Date()))
@@ -173,6 +176,56 @@ struct InteractionSmoke {
         precondition(!model.needsAnswer(stoppedRepair), "Retry instructions must start a repair rather than answer a question")
         report("PASS: disjoint PR sections, exact waiting reasons, paused/skipped PRs, completed runs, readiness expiry, Watch mode and paused queues")
     }
+    static func checkSpendEdits(_ model: InboxModel) async throws {
+        let draft = AmountSettingsDraft(maximum: 10_000, fractionDigits: 2, locale: Locale(identifier: "en_US"))
+        let original: [String: Double] = ["runCapUSD": 5, "dailyCapUSD": 20]
+        draft.receive(original)
+        draft.edit("dailyCapUSD", text: "")
+        draft.receive(original)
+        precondition(draft.text["dailyCapUSD"] == "", "Live state must not replace an in-progress empty field")
+        var submissions = 0
+        let invalid = await draft.save { _ in submissions += 1; return nil }
+        precondition(!invalid && submissions == 0, "Invalid amounts must not reach the controller")
+        draft.edit("dailyCapUSD", text: "42.50")
+        draft.receive(original)
+        precondition(draft.text["dailyCapUSD"] == "42.50" && draft.hasChanges)
+        DelayedController.server.lock.withLock { DelayedController.server.failSettings = true }
+        let failed = await draft.save { values in
+            await model.updateSettings(values.mapValues { $0 as Any }) ? nil : model.actionError ?? "Save failed"
+        }
+        precondition(!failed && draft.hasChanges && draft.error != nil && draft.text["dailyCapUSD"] == "42.50", "A rejected save must keep the draft and show failure")
+        DelayedController.server.lock.withLock { DelayedController.server.failSettings = false }
+        let saved = await draft.save { values in
+            await model.updateSettings(values.mapValues { $0 as Any }) ? nil : model.actionError ?? "Save failed"
+        }
+        precondition(saved && draft.saved && !draft.hasChanges && model.state?.settings?.dailyCapUSD == 42.5, "A successful save must be confirmed by the controller")
+        draft.edit("dailyCapUSD", text: "50")
+        let pending = Task { await draft.save { values in
+            try? await Task.sleep(for: .milliseconds(100))
+            submissions += 1
+            precondition(values["dailyCapUSD"] == 50, "The request uses the submitted snapshot")
+            return nil
+        } }
+        try await until { draft.saving }
+        draft.edit("dailyCapUSD", text: "60")
+        draft.receive(original)
+        _ = await pending.value
+        precondition(draft.text["dailyCapUSD"] == "60" && draft.hasChanges && !draft.saved, "An acknowledgement cannot erase newer edits")
+        for value in ["-1", "10001", "1.234", "12oops", "NaN"] {
+            draft.edit("dailyCapUSD", text: value)
+            precondition(draft.validationError != nil, "Reject invalid limits: \(value)")
+        }
+        let localized = AmountSettingsDraft(maximum: 10_000, fractionDigits: 2, locale: Locale(identifier: "de_DE"))
+        localized.receive(["dailyCapUSD": 20]); localized.edit("dailyCapUSD", text: "12,50")
+        let localizedSaved = await localized.save { values in precondition(values["dailyCapUSD"] == 12.5); return nil }
+        precondition(localizedSaved && localized.saved, "Respect the locale's decimal separator")
+        let rates = AmountSettingsDraft(maximum: 100_000, fractionDigits: 4, locale: Locale(identifier: "en_US"))
+        rates.receive(["cached": 0.05]); rates.edit("cached", text: "0.0001")
+        precondition(rates.validationError == nil)
+        let rateSaved = await rates.save { values in precondition(values["cached"] == 0.0001); return nil }
+        precondition(rateSaved)
+        report("PASS: spend drafts survive refresh, validation, rejected saves and late acknowledgements; explicit saves persist; localized amounts and token-rate precision work")
+    }
     static func report(_ message: String) { print(message); fflush(nil) }
     static func main() async throws {
         _ = NSApplication.shared
@@ -240,6 +293,7 @@ struct InteractionSmoke {
         try await until { model.pendingMode == nil }
         precondition(model.mode == .watch, "Successful saves must confirm the requested mode")
         report("PASS: immediate mode feedback, failure rollback and successful confirmation")
+        try await checkSpendEdits(model)
 
         window.contentView = nil
         model.selectedNumber = nil
