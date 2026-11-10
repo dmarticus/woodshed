@@ -45,7 +45,7 @@ export class Worker {
     if (this.config.resumeThreadId || this.config.recoverRun) {
       const prior: WorkerState = await Bun.file(join(this.config.directory, "runtime.json")).json();
       if (prior.id !== this.config.id || prior.threadId !== this.config.resumeThreadId) throw new Error("Run identity changed before resuming");
-      this.state = { ...prior, state: "running", status: "working", prompt: undefined, activeTurn: undefined, endedAt: undefined };
+      this.state = { ...prior, budgetUSD: this.config.budgetUSD, state: "running", status: "working", prompt: undefined, activeTurn: undefined, endedAt: undefined };
       if (this.state.costUSD === null || this.state.costUSD >= this.config.budgetUSD) { await this.cap(); return; }
     }
     this.state.pid = process.pid;

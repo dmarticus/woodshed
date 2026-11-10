@@ -860,7 +860,8 @@ export class Controller {
   }
   budgetAvailable(): number {
     if (this.store.spend(this.config.dailyCapUSD ?? 20).unknownRuns) return 0;
-    const reserved = this.store.unfinishedRuns().filter(r => ["preparing", "running", "waiting"].includes(r.state)).reduce((sum, r) => sum + Math.max(0, (r.budgetUSD ?? 0) - (r.costUSD ?? 0)), 0);
+    const jobBudgets = new Map(this.store.all().filter(r => r.job?.budgetUSD !== undefined).map(r => [r.job!.name, r.job!.budgetUSD!]));
+    const reserved = this.store.unfinishedRuns().filter(r => ["preparing", "running", "waiting"].includes(r.state)).reduce((sum, r) => sum + Math.max(0, (jobBudgets.get(r.id) ?? r.budgetUSD ?? 0) - (r.costUSD ?? 0)), 0);
     return dollarsDown((this.config.dailyCapUSD ?? 20) - this.store.spent(localDay()) - reserved);
   }
   initialRun(job: Job, number: number): Run {
@@ -893,7 +894,7 @@ export class Controller {
         for (const record of this.store.all().filter(r => r.job?.adapter === "app-server")) {
           const run = this.store.run(record.job!.name);
           if (run?.state !== "running") continue;
-          if (!dailyReached && (run.costUSD ?? 0) < (record.job!.budgetOverride ? run.budgetUSD ?? Infinity : Math.min(run.budgetUSD ?? Infinity, this.config.runCapUSD ?? 5))) continue;
+          if (!dailyReached && (run.costUSD ?? 0) < (record.job!.budgetOverride ? record.job!.budgetUSD ?? run.budgetUSD ?? Infinity : Math.min(record.job!.budgetUSD ?? run.budgetUSD ?? Infinity, this.config.runCapUSD ?? 5))) continue;
           await this.runner.stop(record.job!);
           await this.finishRun(record.job!, record.snapshot.number, "budget", dailyReached ? "Daily spend cap reached" : "Run spend cap reached");
           freedSlot = true;

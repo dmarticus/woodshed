@@ -74,3 +74,13 @@ test("a completed worker immediately asks the scheduler to refill free slots", a
   await f.controller.checkBudgets(); expect(polls).toBe(1);
   await f.controller.checkBudgets(); expect(polls).toBe(1);
 });
+
+
+test("active job allocations override stale resumed-worker budget telemetry in either direction", async () => {
+  const f = fixture(20); await f.controller.reconcile(snapshot(1));
+  const record = f.store.get(1)!; const run = f.store.run(record.job!.name)!;
+  record.job!.budgetUSD = 2; f.store.put(record); run.budgetUSD = 5; f.store.saveRun(run);
+  expect(f.controller.budgetAvailable()).toBe(18);
+  record.job!.budgetUSD = 6; f.store.put(record); run.budgetUSD = 2; f.store.saveRun(run);
+  expect(f.controller.budgetAvailable()).toBe(14);
+});

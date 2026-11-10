@@ -139,12 +139,12 @@ test("resuming an upgraded worker preserves accumulated usage and spend", async 
   instance.state.costUSD = 0.25; instance.state.turns = 2;
   instance.state.usage = { ...emptyUsage(), inputTokens: 1000, totalTokens: 1000 };
   await instance.persist();
-  instance.config.resumeThreadId = "thread"; instance.config.resumeQueued = true;
+  instance.config.resumeThreadId = "thread"; instance.config.resumeQueued = true; instance.config.budgetUSD = 0.75;
   instance.rpc.initialize = async () => {};
   instance.rpc.request = async (method: string, params: unknown) => { calls.push({ method, params }); return { thread: { id: "thread" } }; };
   await instance.start();
   await instance.event({ method: "thread/tokenUsage/updated", params: { tokenUsage: { total: instance.state.usage, last: instance.state.usage } } });
-  expect(instance.state.costUSD).toBe(0.25); expect(instance.state.turns).toBe(2);
+  expect(instance.state.costUSD).toBe(0.25); expect(instance.state.turns).toBe(2); expect(instance.state.budgetUSD).toBe(0.75);
   expect(calls[0].method).toBe("thread/resume"); expect(instance.state.state).toBe("waiting");
 });
 
