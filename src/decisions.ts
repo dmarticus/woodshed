@@ -4,7 +4,7 @@ import { failed, type AssessmentResult, type Decision, type Record, type Snapsho
 export function bindDecision(record: Record): void {
   if (record.decision.kind !== "human") return;
   const decision = record.decision;
-  const content = JSON.stringify({ title: decision.title, question: decision.question ?? decision.reason, options: decision.options, response: decision.response === "reply" ? undefined : decision.response });
+  const content = JSON.stringify({ context: decision.context, title: decision.title, question: decision.question ?? decision.reason, options: decision.options, response: decision.response === "reply" ? undefined : decision.response });
   const questionKey = createHash("sha256").update(content).digest("hex");
   decision.questionKey = questionKey;
   decision.id = createHash("sha256").update(record.snapshot.head + questionKey).digest("hex");

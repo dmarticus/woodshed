@@ -85,6 +85,18 @@ if (process.argv.includes("--needs-access") || process.argv.includes("--repair-s
     : { kind: "human", response: "retry", title: "CI still needs a fix", reason: "Woodshed stopped after repeated attempts to finish this repair.", question: "Review what remains, then retry with instructions or finish the fix yourself.", action: { label: "Open failed check", url: "https://github.com/example/project/actions" } };
   record.assessment = { report: "The CI provider reported a missing API token on the maintenance server. No retry was submitted.", result: { route: "ask", title: record.decision.title!, evidence: [{ url: "https://depot.dev/job/example", detail: "The CI job failed before the test runner started." }] } } as any;
 }
+const queuePreview = process.argv.find(value => value.startsWith("--merge-queue-"))?.replace("--merge-queue-", "");
+if (queuePreview) {
+  const record = prs[0]; record.snapshot.draft = false; delete record.job;
+  record.mergeQueue = { state: queuePreview === "stack" || queuePreview === "ready" ? "available" : queuePreview, active: ["testing", "pending_failure"].includes(queuePreview), url: "https://app.trunk.io/example/merge-queue/queue/104" };
+  record.decision = record.mergeQueue.active ? { kind: "waiting", reason: "Trunk is testing this PR" } : { kind: "ready", reason: "Ready" };
+  record.mergeQueueSubmission = { canSubmit: !record.mergeQueue.active, reason: null, label: queuePreview === "stack" ? "Add 2 PRs to merge queue" : "Add to merge queue", scope: queuePreview === "stack" ? [103, 104] : [104], heads: { "104": record.snapshot.head, ...(queuePreview === "stack" ? { "103": "parent-head" } : {}) } };
+  if (queuePreview === "failed") {
+    record.mergeQueue.reason = "This pull request was removed from the merge queue because required tests failed.";
+    record.mergeQueue.terminal = { id: "queue-attempt-1", reason: record.mergeQueue.reason };
+    record.decision = { kind: "human", title: "Removed from the merge queue", reason: "This PR did not pass the merge queue’s checks.", response: "recheck" };
+  }
+}
 const mode = approvalPreview ? "watch" : "auto";
 for (const record of prs) record.approval = approvalRequestState(record, true, mode);
 const quiet = process.argv.includes("--quiet");

@@ -1,3 +1,5 @@
+import { GitHub } from "./github";
+import { activeQueuePhase } from "./merge-queue";
 import { mkdirSync, renameSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -18,6 +20,11 @@ export class Runner {
   models: Models;
   onProgress?: (run: WorkerState) => void;
   constructor(readonly config: Config, readonly dataDir: string, readonly exec: typeof command = command) { this.models = new Models(config); }
+  private async guardMergeQueue(current: Snapshot): Promise<void> {
+    if (!current.mergeQueue) return;
+    const queue = await new GitHub(this.config, this.exec).mergeQueue(current);
+    if (!queue || queue.error || queue.state === "unknown" || activeQueuePhase(queue.state)) throw Error("PR is in the merge queue or its queue status could not be confirmed. Saved edits are retained; no publication was attempted.");
+  }
   async launch(pr: Snapshot, job: Job): Promise<void> {
     try {
       await this.preparation(pr.number, job, "Preparing the PR checkout");
@@ -198,6 +205,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
         await this.stop(job);
         if (!current) return { state: "human", reason: "Cannot publish without a current PR snapshot" };
         try {
+          await this.guardMergeQueue(current);
           const target = JSON.parse(await this.exec(["gh", "pr", "view", String(current.number), "--repo", this.config.repository, "--json", "headRefOid,headRefName,baseRefName,state,isDraft"]));
           if (target.headRefName !== current.branch || target.baseRefName !== current.base) throw new SupersededUpdate("PR target changed before publication");
           const live = { ...current, head: target.headRefOid, branch: target.headRefName, base: target.baseRefName, state: target.state, draft: target.isDraft };
@@ -269,6 +277,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
         if (terminal.state === "live") await this.exec(["hc", "kill", job.name]);
       }
       await update.allowAdjacentResolution(plan);
+      await this.guardMergeQueue(current);
       const target = JSON.parse(await this.exec(["gh", "pr", "view", String(plan.number), "--repo", this.config.repository, "--json", "headRefOid,headRefName,baseRefName,state,isDraft"]));
       const verified = { ...current, head: target.headRefOid, branch: target.headRefName, base: target.baseRefName, state: target.state, draft: target.isDraft };
       const result = await update.finish(plan, verified);

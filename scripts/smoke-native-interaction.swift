@@ -234,6 +234,35 @@ struct InteractionSmoke {
         precondition(rateSaved)
         report("PASS: spend drafts survive refresh, validation, rejected saves and late acknowledgements; explicit saves persist; localized amounts and token-rate precision work")
     }
+    static func checkMergeQueue(_ payload: [String: Any]) throws {
+        var data = payload
+        var records = data["prs"] as! [[String: Any]]
+        var record = records[0]
+        let number = (record["snapshot"] as! [String: Any])["number"] as! Int
+        var snapshot = record["snapshot"] as! [String: Any]; snapshot["draft"] = false
+        record["snapshot"] = snapshot; record.removeValue(forKey: "job")
+        record["decision"] = ["kind": "waiting", "reason": "Trunk is testing this PR"]
+        var queue: [String: Any] = ["state": "testing", "active": true, "url": "https://app.trunk.io/example/merge-queue/queue/104"]
+        record["mergeQueue"] = queue; records[0] = record; data["prs"] = records
+        func decoded() throws -> InboxState { try JSONDecoder().decode(InboxState.self, from: JSONSerialization.data(withJSONObject: data)) }
+        let model = InboxModel(previewState: try decoded())
+        precondition(model.section(for: model.state!.prs[0]) == .mergeQueue)
+        precondition(model.mergeQueuePRs.contains { $0.id == number })
+        queue["active"] = false; queue["state"] = "failed"
+        queue["terminal"] = ["id": "attempt-1", "reason": "Tests failed", "acknowledged": false]
+        record["mergeQueue"] = queue; record["decision"] = ["kind": "human", "reason": "Queue tests failed", "id": "old-decision"]
+        records[0] = record; data["prs"] = records; model.state = try decoded()
+        let first = model.state!.prs[0]
+        precondition(model.section(for: first) == .attention)
+        snapshot["head"] = "changed-head"; record["snapshot"] = snapshot
+        record["decision"] = ["kind": "human", "reason": "Queue tests failed", "id": "new-decision"]
+        records[0] = record; data["prs"] = records; model.state = try decoded()
+        precondition(model.notificationVersion(first) == model.notificationVersion(model.state!.prs[0]))
+        queue["terminal"] = ["id": "attempt-2", "reason": "Tests failed"]
+        record["mergeQueue"] = queue; records[0] = record; data["prs"] = records; model.state = try decoded()
+        precondition(model.notificationVersion(first) != model.notificationVersion(model.state!.prs[0]))
+        report("PASS: Trunk queue progress has its own section; terminal events need attention and notify once per attempt across head changes")
+    }
     static func report(_ message: String) { print(message); fflush(nil) }
     static func main() async throws {
         _ = NSApplication.shared
@@ -250,6 +279,7 @@ struct InteractionSmoke {
         gate.retain([])
         precondition(!gate.ready("42", version: "new question", at: start.addingTimeInterval(20)))
         report("PASS: notifications wait for a stable decision and reset when attention changes or disappears")
+        try checkMergeQueue(payload)
         try checkSections(payload)
         DelayedController.server.state = payload
         URLProtocol.registerClass(DelayedController.self)

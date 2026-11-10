@@ -7,7 +7,7 @@ import { readiness } from "./readiness";
 type PRState = { episode: string; enrolledAt: number; baseline: boolean; phase: string | null; active: boolean; decisions: number; decision?: string; decisionAt?: number; ready: boolean };
 type RunState = { state: string; ended: boolean; revision: number; segment: number; cost: number; costKnown: boolean; baseline: boolean; kind: string; trigger: string; episode: string | null; startedAt: number };
 export type ActionSource = "native_app" | "notification" | "mcp" | "automation";
-const actions = new Set(["pause", "resume", "reply", "interrupt", "retry", "reviewer", "watch", "unwatch", "skip", "recheck", "topup", "stop", "confirm-reply", "discard-reply", "mark-ready", "mark-draft", "request-approval", "open_pr", "copy_pr_link", "refresh_all", "merge_on_github", "open_session"]);
+const actions = new Set(["pause", "resume", "reply", "interrupt", "retry", "reviewer", "watch", "unwatch", "skip", "recheck", "topup", "stop", "confirm-reply", "discard-reply", "mark-ready", "mark-draft", "request-approval", "open_pr", "copy_pr_link", "refresh_all", "merge_on_github", "submit-merge-queue", "dismiss-queue-alert", "open_session"]);
 
 /** Observe persisted facts once, regardless of whether a UI, an agent, or a poll caused them. */
 export class ProductAnalytics {

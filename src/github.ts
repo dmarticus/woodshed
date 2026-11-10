@@ -1,3 +1,4 @@
+import { QueueSubmissionRejected, parseTrunkComments, parseTrunkCheck, type QueueObservation } from "./merge-queue";
 import { command } from "./command";
 import type { Config, Snapshot, ReviewThreadAssessment } from "./model";
 import { diagnosticText, namedTestFailures, type CIEvidence, type CheckFailureReport } from "./check-evidence";
@@ -12,6 +13,46 @@ export class GitHub {
   private primed = new Map<number, any>();
   private conditional = new Map<string, { etag: string; data: any }>();
   private signalCache = new Map<string, { time: number; signal?: InfrastructureSignal }>();
+  private async queueComments(number: number): Promise<any[]> {
+    const comments: any[] = [];
+    for (let page = 1; page <= 20; page++) {
+      const rows = await this.conditionalJSON(`repos/${this.config.repository}/issues/${number}/comments?per_page=100&page=${page}`);
+      if (!Array.isArray(rows)) throw Error("Invalid merge queue comment response");
+      comments.push(...rows);
+      if (rows.length < 100) return comments;
+    }
+    throw Error("Queue comment history exceeds the supported page limit");
+  }
+  async mergeQueue(pr: Snapshot): Promise<QueueObservation | undefined> {
+    if (pr.state !== "OPEN") return undefined;
+    try {
+      const bot = parseTrunkComments(await this.queueComments(pr.number), pr);
+      const check = parseTrunkCheck(pr);
+      return bot && bot.state !== "available" ? bot : check ?? bot;
+    } catch {
+      // Preserve prior queue membership on an outage. Never infer an eviction
+      // from missing/partial data or an authentication/rate-limit failure.
+      return { provider: "trunk", state: "unknown", revision: "unavailable", url: pr.url, error: "Could not refresh Trunk queue status. Woodshed will check again." };
+    }
+  }
+  async submitMergeQueue(pr: Snapshot, requestId: string): Promise<string> {
+    if (!/^[a-f0-9-]{36}$/.test(requestId)) throw Error("Invalid queue submission identifier");
+    let posting = false;
+    try {
+    const marker = `<!-- woodshed-merge-queue:${requestId} head:${pr.head} -->`;
+    const existing = (await this.queueComments(pr.number)).find(c => c.user?.login === this.viewerName && c.body?.includes(marker));
+    if (existing) return existing.html_url;
+    const fresh = JSON.parse(await this.request(["gh", "pr", "view", String(pr.number), "--repo", this.config.repository, "--json", "headRefOid,baseRefName,state,isDraft"]));
+    if (fresh.headRefOid !== pr.head || fresh.baseRefName !== pr.base || fresh.state !== "OPEN" || fresh.isDraft) throw Error("The PR changed before queue submission. Refresh and review the current version.");
+    posting = true;
+    const comment = JSON.parse(await this.request(["gh", "api", `repos/${this.config.repository}/issues/${pr.number}/comments`, "--method", "POST", "-f", `body=/trunk merge\n\n${marker}`]));
+    if (typeof comment.html_url !== "string") throw Error("Queue submission could not be confirmed");
+    return comment.html_url;
+    } catch (error) {
+      if (!posting || /HTTP\s+(?:400|401|403|404|422)\b/.test(String(error))) throw new QueueSubmissionRejected(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
   async failureEvidence(pr: Snapshot): Promise<CIEvidence> {
     const failures = pr.checks.filter(failed);
     const evidence: CIEvidence = { head: pr.head, reports: [], unavailable: [] };
@@ -101,7 +142,7 @@ export class GitHub {
     for (let offset = 0; offset < numbers.length; offset += 25) {
       const batch = numbers.slice(offset, offset + 25);
       if (batch.some(n => !Number.isSafeInteger(n) || n <= 0)) throw new Error("Invalid PR number");
-      const selections = batch.map(n => `p${n}:pullRequest(number:${n}){number title url headRefOid headRefName baseRefName baseRefOid state isDraft mergeable mergeStateStatus reviewDecision body updatedAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}} reviewRequests(first:100){nodes{requestedReviewer{...on User{login} ...on Team{name slug}}} pageInfo{hasNextPage}} reviewThreads(first:20){nodes{id isResolved comments(first:10){nodes{author{login __typename} body url} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}} reviews(first:30){nodes{author{login} state body commit{oid} submittedAt} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{...on CheckRun{isRequired(pullRequestNumber:${n}) name status conclusion detailsUrl startedAt checkSuite{workflowRun{id createdAt workflow{id}}}} ...on StatusContext{isRequired(pullRequestNumber:${n}) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`).join(" ");
+      const selections = batch.map(n => `p${n}:pullRequest(number:${n}){number title url headRefOid headRefName baseRefName baseRefOid state isDraft mergeable mergeStateStatus reviewDecision body updatedAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}} reviewRequests(first:100){nodes{requestedReviewer{...on User{login} ...on Team{name slug}}} pageInfo{hasNextPage}} reviewThreads(first:20){nodes{id isResolved comments(first:10){nodes{author{login __typename} body url} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}} reviews(first:30){nodes{author{login} state body commit{oid} submittedAt} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{...on CheckRun{isRequired(pullRequestNumber:${n}) name status conclusion detailsUrl startedAt checkSuite{app{slug} workflowRun{id createdAt workflow{id}}}} ...on StatusContext{isRequired(pullRequestNumber:${n}) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`).join(" ");
       const result = JSON.parse(await this.request(["gh", "api", "graphql", "-f", `query=query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${selections}}}`]));
       if (result.errors) throw new Error("GitHub batch query failed: " + JSON.stringify(result.errors));
       for (const n of batch) {
@@ -157,6 +198,7 @@ export class GitHub {
   canMaintainKnown(pr: Snapshot): boolean {
     return !!pr.author && !!this.viewerName && pr.author.toLowerCase() === this.viewerName.toLowerCase();
   }
+  async freshSnapshot(number: number): Promise<Snapshot> { this.primed.delete(number); return this.snapshot(number); }
   async snapshot(number: number): Promise<Snapshot> {
     const pr = this.primed.get(number) ?? JSON.parse(await this.request(["gh", "pr", "view", String(number), "--repo", this.config.repository, "--json", "number,title,url,headRefOid,headRefName,baseRefName,baseRefOid,state,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,author,body,updatedAt,reviewRequests"]));
     this.primed.delete(number);
@@ -188,7 +230,7 @@ export class GitHub {
     let cursor: string | null = null;
     const checks: Snapshot["checks"] = [];
     do {
-      const args = ["gh", "api", "graphql", "-f", "query=query($owner:String!,$name:String!,$head:GitObjectID!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{... on CheckRun{isRequired(pullRequestNumber:$number) name status conclusion detailsUrl startedAt checkSuite{workflowRun{id createdAt workflow{id}}}} ... on StatusContext{isRequired(pullRequestNumber:$number) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}", "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `head=${pr.headRefOid}`, "-F", `number=${number}`];
+      const args = ["gh", "api", "graphql", "-f", "query=query($owner:String!,$name:String!,$head:GitObjectID!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{... on CheckRun{isRequired(pullRequestNumber:$number) name status conclusion detailsUrl startedAt checkSuite{app{slug} workflowRun{id createdAt workflow{id}}}} ... on StatusContext{isRequired(pullRequestNumber:$number) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}", "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `head=${pr.headRefOid}`, "-F", `number=${number}`];
       if (cursor) args.push("-f", `cursor=${cursor}`);
       const result = !cursor && pr._checks ? { data: { repository: { object: { statusCheckRollup: { contexts: pr._checks } } } } } : JSON.parse(await this.request(args));
       if (result.errors) throw new Error(JSON.stringify(result.errors));
@@ -198,7 +240,7 @@ export class GitHub {
         name: c.context, status: ["PENDING", "EXPECTED"].includes(c.state) ? "IN_PROGRESS" : "COMPLETED",
         conclusion: c.state === "SUCCESS" ? "SUCCESS" : c.state === "FAILURE" || c.state === "ERROR" ? "FAILURE" : null,
         required: c.isRequired, url: c.targetUrl ?? "", description: c.description ?? undefined,
-      } : { required: c.isRequired, name: c.name, status: c.status, conclusion: c.conclusion, url: c.detailsUrl ?? "", startedAt: c.startedAt ?? undefined,
+      } : { app: c.checkSuite?.app?.slug, required: c.isRequired, name: c.name, status: c.status, conclusion: c.conclusion, url: c.detailsUrl ?? "", startedAt: c.startedAt ?? undefined,
         ...(c.checkSuite?.workflowRun?.workflow ? { source: { workflow: c.checkSuite.workflowRun.workflow.id, run: c.checkSuite.workflowRun.id, createdAt: c.checkSuite.workflowRun.createdAt } } : {}) });
       cursor = connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
     } while (cursor);

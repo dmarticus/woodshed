@@ -101,6 +101,7 @@ struct MenuContent: View {
                     }
                 }.padding(12)
             }
+            if !model.mergeQueuePRs.isEmpty { statusGroup("\(model.mergeQueuePRs.count) in merge queue", records: model.mergeQueuePRs, icon: "arrow.triangle.merge") }
             if !model.queued.isEmpty { statusGroup("\(model.queued.count) queued", records: model.queued, icon: "tray") }
             if !model.waiting.isEmpty { statusGroup("\(model.waiting.count) waiting", records: model.waiting, icon: "clock") }
             if !model.pausedPRs.isEmpty { statusGroup("\(model.pausedPRs.count) paused", records: model.pausedPRs, icon: "pause.circle") }
@@ -210,6 +211,7 @@ struct PRSidebar: View {
                         }
                     }
                 }
+                if !model.mergeQueuePRs.isEmpty { Section("Merge queue") { ForEach(model.mergeQueuePRs) { sidebarRow($0) } } }
                 if !model.queued.isEmpty { Section("Queued") { ForEach(model.queued) { sidebarRow($0) } } }
                 if !model.ready.isEmpty { Section("Ready to merge") { ForEach(model.ready) { sidebarRow($0) } } }
                 if !model.waiting.isEmpty { Section("Waiting") { ForEach(model.waiting) { sidebarRow($0) } } }
@@ -315,6 +317,7 @@ struct PRDetailView: View {
                         }.padding(14).background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                     }
                     primaryActions(record)
+                    MergeQueueControls(record: record, model: model, repair: { openComposer(record) })
                     if record.decision.kind != "human" { ApprovalRequestView(record: record, model: model) }
                     if record.decision.kind == "ready", let report = record.readiness {
                         Fold("Readiness report") {
@@ -330,7 +333,7 @@ struct PRDetailView: View {
                     if requestingReviewer { HStack { TextField("GitHub username or organization/team", text: $reviewer).textFieldStyle(.roundedBorder); Button("Request review") { Task { if await model.act("reviewer", on: record, reviewer: reviewer) { reviewer = ""; requestingReviewer = false } } }.disabled(!model.canAct(on: record) || reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
                     if showChecks { CheckSummaryView(record: record, model: model) }
                     if showReview { ReviewThreadsView(record: record, model: model) }
-                    if canCompose(record) {
+                    if canCompose(record) && record.mergeQueue?.active != true {
                         if composerNumber == record.id || model.needsAnswer(record) && (record.decision.options?.isEmpty ?? true) || model.lastRun(record)?.prompt?.kind == "question" {
                             RunComposer(record: record, model: model, focus: $answerFocused)
                         } else if record.decision.kind != "human" {
@@ -441,13 +444,15 @@ struct PRDetailView: View {
             }.padding(.vertical, 8)
         } else if !record.isWatched {
             Button("Watch PR") { Task { await model.act("watch", on: record) } }.buttonStyle(.borderedProminent).disabled(!model.canAct(on: record))
+        } else if record.mergeQueue?.active == true || record.mergeQueue?.needsAttention == true {
+            EmptyView()
         } else if record.paused {
             Button("Resume") { Task { await model.act("resume", on: record) } }.buttonStyle(.borderedProminent).disabled(!model.canAct(on: record))
         } else if model.mode == .paused {
             Button("Resume Auto") { Task { await model.updateSettings(["mode": "auto"]) } }.buttonStyle(.borderedProminent).disabled(!model.canSaveSettings)
         } else if record.decision.kind == "ready" {
-            if record.readiness?.ready == false { Button("Refresh readiness") { Task { await model.recheck(record) } }.buttonStyle(.borderedProminent).disabled(!model.canAct(on: record)) }
-            else { Button("Merge on GitHub") { model.track("merge_on_github", number: record.id); model.openGitHub(record.snapshot.url) }.buttonStyle(.borderedProminent) }
+            if record.mergeQueue == nil && record.readiness?.ready == false { Button("Refresh readiness") { Task { await model.recheck(record) } }.buttonStyle(.borderedProminent).disabled(!model.canAct(on: record)) }
+            else if record.mergeQueue == nil { Button("Merge on GitHub") { model.track("merge_on_github", number: record.id); model.openGitHub(record.snapshot.url) }.buttonStyle(.borderedProminent) }
         } else if record.decision.kind == "human" {
             VStack(alignment: .leading, spacing: 10) {
                 Text(record.decision.title ?? (model.needsAnswer(record) ? "Answer this question" : "The repair needs your help")).font(.headline)
@@ -570,6 +575,52 @@ struct RunCard: View {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+struct MergeQueueControls: View {
+    let record: PullRequestRecord
+    @ObservedObject var model: InboxModel
+    let repair: () -> Void
+    var body: some View {
+        if let queue = record.mergeQueue {
+            if queue.active {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("In Trunk merge queue", systemImage: "arrow.triangle.merge").font(.headline)
+                    Text(queue.status).font(.callout)
+                    if queue.state == "pending_failure" { Text("Trunk may restart testing if an earlier PR caused the failure. No action needed yet.").font(.callout).foregroundStyle(.secondary) }
+                    if let error = queue.error { Text(error).font(.callout).foregroundStyle(.secondary) }
+                    Button("View queue status") { model.openGitHub(queue.url) }.buttonStyle(.link)
+                    if let request = queue.submission?.url { Button("View submission on GitHub") { model.openGitHub(request) }.buttonStyle(.link).font(.caption) }
+                }.padding(.vertical, 8)
+            } else if queue.needsAttention || record.mergeQueueSubmission?.canSubmit == true || record.decision.kind == "ready" {
+                VStack(alignment: .leading, spacing: 10) {
+                    if queue.needsAttention {
+                        Text("Removed from the merge queue").font(.headline)
+                        Text(record.decision.reason).font(.callout).fixedSize(horizontal: false, vertical: true)
+                        Button("Open queue failure") { model.openGitHub(queue.url) }.buttonStyle(.link)
+                        if let detail = queue.terminal?.reason { Fold("Queue failure details") { FeedbackText(text: detail).font(.callout) } }
+                    }
+                    if let submission = record.mergeQueueSubmission {
+                        if submission.scope.count > 1 { Text("Includes " + submission.scope.map { "#" + String($0) }.joined(separator: ", ")).font(.caption).foregroundStyle(.secondary) }
+                        Button {
+                            Task { await model.act("submit-merge-queue", on: record) }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if model.pendingActions[record.id] == "submit-merge-queue" { ProgressView().controlSize(.small) }
+                                Text(model.pendingActions[record.id] == "submit-merge-queue" ? "Submitting…" : submission.label)
+                            }
+                        }.buttonStyle(.borderedProminent).disabled(!submission.canSubmit || !model.canAct(on: record) || model.mode == .paused)
+                        if !submission.canSubmit, let reason = submission.reason { Text(reason).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    }
+                    if queue.needsAttention {
+                        HStack {
+                            Button("Repair with instructions…", action: repair).disabled(!model.canAct(on: record))
+                            Button("Dismiss alert") { Task { await model.act("dismiss-queue-alert", on: record) } }.buttonStyle(.link).disabled(!model.canAct(on: record))
+                        }
+                    }
+                }.padding(.vertical, 8)
             }
         }
     }

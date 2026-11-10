@@ -1,4 +1,5 @@
-export type Check = { required?: boolean; name: string; status: string; conclusion: string | null; url: string; description?: string; startedAt?: string; source?: { workflow: string; run: string; createdAt: string } };
+import { mergeQueueDecision, queueCheck } from "./merge-queue";
+export type Check = { app?: string; required?: boolean; name: string; status: string; conclusion: string | null; url: string; description?: string; startedAt?: string; source?: { workflow: string; run: string; createdAt: string } };
 export type Thread = { id: string; comments: { author: string; authorType?: string; body: string; url: string }[] };
 export type Review = { author: string; state: string; body: string; head: string; submittedAt: string };
 export type Snapshot = {
@@ -6,7 +7,7 @@ export type Snapshot = {
   state: string; draft: boolean; mergeable: string; mergeStateStatus: string;
   reviewDecision: string | null; checks: Check[]; threads: Thread[]; reviews: Review[]; labels: string[];
   author?: string; body?: string; updatedAt?: string; reviewRequests?: string[]; stack?: { position: number; size: number } | null;
-  baseHead?: string;
+  baseHead?: string; mergeQueue?: import("./merge-queue").QueueObservation;
 };
 export type Decision = {
   kind: "paused" | "waiting" | "fix" | "review" | "approval" | "human" | "ready" | "closed";
@@ -15,7 +16,7 @@ export type Decision = {
   action?: { label: string; url: string };
   title?: string;
   question?: string;
-  id?: string; questionKey?: string;
+  context?: string; id?: string; questionKey?: string;
   options?: { id: string; label: string; value: string }[];
 };
 export type Job = { name: string; head: string; fingerprint: string; startedAt: string; kind?: "repair" | "branch-update" | "triage"; instructions?: string; afterTurn?: number; model?: string; budgetUSD?: number; adapter?: "app-server"; budgetOverride?: boolean; manual?: boolean; freshCheckout?: boolean; handoff?: import("./handoff").Handoff; ciEvidence?: import("./check-evidence").CIEvidence; repairHints?: import("./playbooks").RepairHint[]; playbooksApplied?: string[] };
@@ -32,6 +33,7 @@ export type Record = {
   pendingPromptId?: string; skippedHead?: string; budgetDay?: string;
   humanObservation?: JobObservation;
   assessment?: Assessment;
+  mergeQueue?: import("./merge-queue").QueueTracking;
   closedAt?: string; sleepInterruptedAt?: string;
   pendingAnswer?: { text: string; questionKey?: string; requiresConfirmation: boolean };
   topUpUSD?: number;
@@ -104,10 +106,12 @@ export const stamphogRefused = (pr: Snapshot): boolean => {
 export const reviewedOnHead = (pr: Snapshot): boolean => pr.reviews.some(r => r.head === pr.head && (r.state === "APPROVED" || /posthog|review.hog/i.test(r.author) && !/stamphog/i.test(r.author)));
 
 export function decide(pr: Snapshot, record?: Record): Decision {
+  pr = { ...pr, checks: pr.checks.filter(c => !queueCheck(c)) };
   if (pr.state !== "OPEN") return { kind: "closed", reason: pr.state === "MERGED" ? "Merged" : "Closed" };
   if (record?.watching === false) return { kind: "paused", reason: "Not watching this PR" };
   if (record?.skippedHead === pr.head) return { kind: "paused", reason: "Skipped this run on the current commit" };
   if (record?.paused || pr.draft) return { kind: "paused", reason: pr.draft ? "Draft PR" : "Paused by you" };
+  if (record) { const queue = mergeQueueDecision(record); if (queue) return queue; }
   if (record?.job) return { kind: "waiting", reason: record.job.kind === "branch-update" ? "Automatically resolving conflicts and updating the PR branch" : "Coding agent is working" };
   if (record?.humanHead === pr.head) return { kind: "human", reason: record.humanReason ?? "Agent needs your input" };
   if (stamphogRefused(pr)) return { kind: "human", title: "Request a human review", reason: "Stamphog could not approve these changes. A human reviewer is needed.", action: { label: "Open reviewers on GitHub", url: pr.url } };

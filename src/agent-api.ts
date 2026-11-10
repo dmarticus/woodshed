@@ -15,9 +15,10 @@ export class AgentAPI {
     const mode = modeOf(this.controller.config);
     const report = this.readiness(number);
     const queue = this.controller.queueStatus(record);
-    const phase = pr.state !== "OPEN" ? "closed" : !record.watching && record.watching !== undefined || record.paused || mode === "paused" && !record.job ? "paused" : record.decision.kind === "human" ? "needs_human" : record.recovery?.retryAt ? "recovering" : record.job && run?.state === "preparing" ? "preparing" : record.job && run?.state === "running" ? "running" : record.decision.kind === "ready" && report.ready ? "ready" : "waiting";
-    const watching = mode === "watch" && !record.job && !["human", "ready", "closed"].includes(record.decision.kind);
-    const owner = phase === "needs_human" || phase === "ready" ? "human" : phase === "closed" || phase === "paused" || watching ? "none" : ["running", "preparing", "recovering"].includes(phase) || ["fix", "review", "approval"].includes(record.decision.kind) ? "woodshed" : pr.reviewRequests?.length ? "reviewer" : "github";
+    const merging = record.mergeQueue?.active === true;
+    const phase = pr.state !== "OPEN" ? "closed" : !record.watching && record.watching !== undefined || record.paused || mode === "paused" && !record.job ? "paused" : record.decision.kind === "human" ? "needs_human" : merging ? "merge_queue" : record.recovery?.retryAt ? "recovering" : record.job && run?.state === "preparing" ? "preparing" : record.job && run?.state === "running" ? "running" : record.decision.kind === "ready" && report.ready ? "ready" : "waiting";
+    const watching = !merging && mode === "watch" && !record.job && !["human", "ready", "closed"].includes(record.decision.kind);
+    const owner = merging ? "trunk" : phase === "needs_human" || phase === "ready" ? "human" : phase === "closed" || phase === "paused" || watching ? "none" : ["running", "preparing", "recovering"].includes(phase) || ["fix", "review", "approval"].includes(record.decision.kind) ? "woodshed" : pr.reviewRequests?.length ? "reviewer" : "github";
     const data = {
       repository: this.controller.config.repository, number, url: pr.url, title: pr.title, head: pr.head, phase, mode,
       next_action: { owner, description: watching ? "Watch mode is monitoring this PR. Enable Auto in Woodshed to start maintenance." : record.decision.kind === "ready" && !report.ready ? report.reasons[0] : queue?.message ?? record.decision.question ?? record.decision.reason, action: record.decision.action ?? null, options: record.decision.options ?? [] },
@@ -29,6 +30,7 @@ export class AgentAPI {
       last_error: record.lastError ?? null,
       dependency: record.stackWait ?? null,
       queue: queue ?? null,
+      merge_queue: record.mergeQueue ?? null,
       shared_ci: record.ciIncident ?? null,
       readiness: readinessSummary(report),
     };

@@ -7,7 +7,7 @@ enum Mode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum PRListSection: CaseIterable {
-    case attention, running, drafts, queued, ready, waiting, paused, unwatched
+    case attention, running, drafts, mergeQueue, queued, ready, waiting, paused, unwatched
 }
 
 struct ModelPrice: Codable, Equatable, Sendable {
@@ -205,6 +205,27 @@ struct PullRequestRecord: Decodable, Identifiable, Sendable {
     }
     struct Job: Decodable, Sendable { let name: String; let kind: String?; let startedAt: String; let model: String?; let adapter: String? }
     struct QueueStatus: Decodable, Sendable { let reason: String; let message: String }
+    struct MergeQueue: Decodable, Sendable {
+        struct Submission: Decodable, Sendable { let url: String?; let uncertain: Bool? }
+        struct Terminal: Decodable, Sendable { let id: String; let reason: String; let acknowledged: Bool? }
+        let state: String; let active: Bool; let url: String; let reason: String?; let error: String?
+        let submission: Submission?; let terminal: Terminal?
+        var needsAttention: Bool { terminal != nil && terminal?.acknowledged != true }
+        var status: String {
+            if error != nil { return "Checking merge queue status" }
+            switch state {
+            case "submitted": return "Waiting for Trunk to accept the submission"
+            case "queued": return "Waiting in Trunk merge queue"
+            case "testing": return "Trunk is testing this PR"
+            case "pending_failure": return "Trunk is investigating a test failure"
+            case "passing": return "Queue tests passed; waiting to merge"
+            default: return "Checking merge queue status"
+            }
+        }
+    }
+    struct MergeQueueSubmission: Decodable, Sendable { let canSubmit: Bool; let reason: String?; let label: String; let scope: [Int]; let heads: [String: String] }
+    let mergeQueue: MergeQueue?
+    let mergeQueueSubmission: MergeQueueSubmission?
     let queue: QueueStatus?
     let assessment: Assessment?
     let snapshot: Snapshot
@@ -238,9 +259,12 @@ struct PullRequestRecord: Decodable, Identifiable, Sendable {
         guard let match = titleMatch, let range = Range(match.range(at: 1), in: snapshot.title) else { return nil }
         return String(snapshot.title[range])
     }
+    var isReadyForQueue: Bool { mergeQueueSubmission?.canSubmit == true && mergeQueue?.active != true && mergeQueue?.needsAttention != true }
     var statusLabel: String {
         if snapshot.draft { return "Draft" }
         if !isWatched { return "Not watching" }
+        if mergeQueue?.active == true { return "In merge queue" }
+        if isReadyForQueue { return "Ready for merge queue" }
         switch decision.kind {
         case "human": return "Needs you"
         case "ready": return readiness?.ready == false ? readiness?.reasons.first ?? "Refreshing readiness" : "Ready to merge"

@@ -68,6 +68,7 @@ if (!demo) {
   setInterval(() => { void cleanArtifacts(resolve(root, ".woodshed"), store).catch(error => store.log(null, `Housekeeping: ${error.message}`)); }, 6 * 3600000);
   void controller.runner.models.list().catch(error => console.error(`Model catalog: ${error.message}`));
   void controller.sync();
+  setInterval(() => { void controller.refreshMergeQueues(); }, 30_000);
   setInterval(() => { void controller.refreshAttention().catch(error => { controller.error = error.message; }); }, 30_000);
   setInterval(() => { void controller.fillWorkers(); }, 2_000);
   setInterval(() => { void controller.checkBudgets().catch(error => { controller.error = error.message; }); }, 1000);

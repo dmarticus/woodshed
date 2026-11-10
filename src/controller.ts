@@ -16,6 +16,8 @@ import type { Analytics } from "./analytics";
 import { ProductAnalytics, type ActionSource } from "./product-analytics";
 import { workerCapacity, dollarsDown, MIN_RUN_BUDGET, ADMISSION_INTERVAL_MS, type CapacityPolicy, type WorkerCapacity } from "./capacity";
 import { ownerAttention, attentionStillNeeded } from "./owner-attention";
+import { QueueSubmissionRejected, trackMergeQueue, mergeQueueDecision } from "./merge-queue";
+import { queueSubmission } from "./merge-queue-readiness";
 import { buildInfo } from "./build-info";
 
 export class Controller {
@@ -35,7 +37,7 @@ export class Controller {
   sleeping = false;
   health() {
     const records = this.store.all();
-    return { build: buildInfo, scheduler: { ...this.capacity(), mode: this.config.concurrencyMode ?? "fixed", cpuTargetPercent: this.config.cpuTargetPercent ?? 80, memoryTargetPercent: this.config.memoryTargetPercent ?? 80, configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
+    return { build: buildInfo, scheduler: { ...this.capacity(), mode: this.config.concurrencyMode ?? "fixed", cpuTargetPercent: this.config.cpuTargetPercent ?? 80, memoryTargetPercent: this.config.memoryTargetPercent ?? 80, configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => !mergeQueueDecision(r) && (r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting")).length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
   }
   power(event: "sleep" | "wake", confirmed = true): void {
     if (process.env.WOODSHED_REMOTE === "1" && confirmed) return;
@@ -97,6 +99,14 @@ export class Controller {
     this.locks.set(number, task);
     try { return await task; } finally { if (this.locks.get(number) === task) this.locks.delete(number); }
   }
+  async refreshMergeQueues(): Promise<void> {
+    if (this.acting || this.budgetChecking || this.sleeping) return;
+    for (const record of this.store.all().filter(r => r.snapshot.state === "OPEN" && r.watching !== false && (r.mergeQueue?.active || r.mergeQueue?.terminal && !r.mergeQueue.terminal.acknowledged))) {
+      if (this.locks.has(record.snapshot.number)) continue;
+      try { await this.withPR(record.snapshot.number, async () => { await this.reconcile(await this.github.snapshot(record.snapshot.number), true); }); }
+      catch (error) { this.store.log(record.snapshot.number, `Queue refresh deferred: ${String(error).slice(0, 300)}`); }
+    }
+  }
   async refreshAttention(): Promise<void> {
     if (this.refreshingAttention || this.acting || this.budgetChecking) return;
     this.refreshingAttention = true;
@@ -137,7 +147,7 @@ export class Controller {
     if (this.activeSlots() >= this.parallelLimit()) return;
     const records = this.store.all();
     const canFundStart = this.budgetAvailable() >= MIN_RUN_BUDGET;
-    const eligible = records.filter(r => !this.locks.has(r.snapshot.number) && !r.paused && r.watching !== false && r.snapshot.state === "OPEN" && !r.snapshot.draft && !r.assessment?.attention && r.decision.kind !== "human" &&
+    const eligible = records.filter(r => !this.locks.has(r.snapshot.number) && !r.paused && r.watching !== false && r.snapshot.state === "OPEN" && !r.snapshot.draft && !r.assessment?.attention && !mergeQueueDecision(r) && r.decision.kind !== "human" &&
       (modeOf(this.config) === "auto" || r.runRequested || r.assessment?.allowWatch || r.pendingReply || r.resumeRequested) &&
       (!r.recovery?.retryAt || Date.parse(r.recovery.retryAt) <= this.now()) && !stackBlock(r.snapshot, records, false) &&
       (r.pendingReply || r.resumeRequested || canFundStart && !r.job && (r.decision.kind === "fix" || r.assessment && (!r.assessment.result || r.assessment.result.route === "repair" && r.assessment.followups < 2))));
@@ -181,6 +191,7 @@ export class Controller {
     const prior = this.store.get(snapshot.number);
     const previousKind = prior?.decision.kind;
     const previousHead = prior?.snapshot.head;
+    const previousDecisionContext = prior?.decision.context;
     const record: Record = prior ?? { snapshot, decision: { kind: "waiting", reason: "Checking PR" }, paused: false, attempts: 0, fingerprint: "" };
     // Upgrade already-visible verified escalations using their previous snapshot
     // before replacing it with fresh GitHub data. Raw worker reports aren't latched.
@@ -198,6 +209,18 @@ export class Controller {
     record.lastError = undefined;
     if (this.sleeping && !observeOnly) { record.decision = { kind: "waiting", reason: "Waiting for the Mac to wake" }; this.store.put(record); return; }
     if (record.recovery?.head !== snapshot.head) record.recovery = undefined;
+    const leader = record.mergeQueue?.owner && record.mergeQueue.owner !== snapshot.number ? this.store.get(record.mergeQueue.owner)?.mergeQueue : undefined;
+    const grouped = leader && leader.groupId === record.mergeQueue?.groupId;
+    const queueObservation = grouped ? { provider: leader.provider, state: leader.state, revision: `group:${leader.revision}`, url: leader.url, reason: leader.reason, updatedAt: leader.updatedAt, error: leader.error } : this.github.mergeQueue ? await this.github.mergeQueue(snapshot) : snapshot.mergeQueue;
+    snapshot.mergeQueue = queueObservation;
+    trackMergeQueue(record, queueObservation, this.now());
+    if (grouped && record.mergeQueue?.terminal) record.mergeQueue.terminal.acknowledged = true;
+    const queueDecision = !snapshot.draft && (record.mergeQueue?.active || !record.paused && record.watching !== false) && mergeQueueDecision(record);
+    if (queueDecision) {
+      if (record.job) await this.queueAssessment(record, "PR entered the merge queue. Agent stopped; saved checkout and edits retained.");
+      if (previousKind !== queueDecision.kind || previousHead !== snapshot.head || previousDecisionContext !== queueDecision.context) record.stateSince = new Date(this.now()).toISOString();
+      record.decision = queueDecision; this.store.put(record); return;
+    }
     if (await this.recover(record, observeOnly)) { this.store.put(record); return; }
     if (record.assessment?.result?.category === "operations" && record.assessment.head !== snapshot.head && snapshot.state === "OPEN") {
       record.assessment = { ...record.assessment, head: snapshot.head, key: "", result: undefined, attention: undefined, attempts: 0, jevChecked: false };
@@ -678,7 +701,7 @@ export class Controller {
     this.store.log(current.number, "Requested Stamphog approval for the current commit");
     return true;
   }
-  async action(number: number, action: string, input: { head?: string; message?: string; reviewer?: string; model?: string; promptId?: string; decisionId?: string; questionKey?: string; runId?: string; amount?: number; source?: ActionSource } = {}): Promise<void> {
+  async action(number: number, action: string, input: { head?: string; message?: string; reviewer?: string; model?: string; promptId?: string; decisionId?: string; questionKey?: string; runId?: string; amount?: number; source?: ActionSource; queueHeads?: {[number: string]: string} } = {}): Promise<void> {
     const started = this.now();
     const source = input.source ?? "native_app";
     if (this.acting || this.budgetChecking) { this.telemetry?.action(number, action, source, true); throw new Error("Another action is running. Try again in a moment."); }
@@ -687,6 +710,52 @@ export class Controller {
     try { await this.withPR(number, async () => {
     let record = this.store.get(number);
     if (!record) throw new Error("PR not found");
+    if (action === "submit-merge-queue") {
+      if (!["native_app", "notification"].includes(source)) throw Error("Merge queue submission requires an explicit action in the Woodshed app.");
+      if (!input.head || !input.queueHeads || modeOf(this.config) === "paused" || this.sleeping) throw Error("Resume Woodshed and refresh this PR before submitting it to the merge queue.");
+      const originalScope = queueSubmission(record, this.config, this.store.all(), this.store.runs(), this.now()).scope;
+      const siblings = originalScope.filter(n => n !== number).sort((a, b) => a - b);
+      if (siblings.some(n => this.locks.has(n))) throw Error("A PR in this stack is being refreshed. Try again in a moment.");
+      const submit = async (): Promise<void> => {
+      for (const n of originalScope) {
+        const member = this.store.get(n)!; const fresh = await (this.github.freshSnapshot?.(n) ?? this.github.snapshot(n));
+        if (fresh.head !== input.queueHeads[String(n)] || n === number && fresh.head !== input.head) throw Error(`PR #${n} changed. Review the current stack before submitting.`);
+        if (!await this.github.canMaintain(fresh)) throw Error("Woodshed only submits your own PRs to the merge queue.");
+        member.snapshot = fresh; member.observedAt = new Date(this.now()).toISOString();
+        const observation = await this.github.mergeQueue(fresh); fresh.mergeQueue = observation; trackMergeQueue(member, observation, this.now()); this.store.put(member);
+      }
+      record = this.store.get(number)!;
+      const eligibility = queueSubmission(record, this.config, this.store.all(), this.store.runs(), this.now());
+      if (!eligibility.canSubmit) throw Error(eligibility.reason ?? "This PR is not ready for the merge queue.");
+      if (Object.keys(input.queueHeads).length !== eligibility.scope.length || eligibility.scope.some(n => input.queueHeads![String(n)] !== eligibility.heads[String(n)])) throw Error("The stack changed. Review its current PRs before submitting.");
+      const previousQueues = new Map(eligibility.scope.map(n => { const r = this.store.get(n)!; return [n, structuredClone({ mergeQueue: r.mergeQueue, decision: r.decision })]; }));
+      const q = record.mergeQueue!; const id = randomUUID();
+      q.submission = { id, head: record.snapshot.head, since: new Date(this.now()).toISOString(), baseline: q.revision };
+      q.active = true; q.state = "submitted"; q.terminal = undefined; q.owner = number; q.groupId = id;
+      record.decision = mergeQueueDecision(record)!; this.store.put(record);
+      for (const n of eligibility.scope.filter(n => n !== number)) {
+        const parent = this.store.get(n)!;
+        const baseline = parent.mergeQueue?.revision ?? "";
+        parent.mergeQueue = { ...q, head: parent.snapshot.head, submission: { ...q.submission, head: parent.snapshot.head, baseline } };
+        parent.decision = mergeQueueDecision(parent)!; this.store.put(parent);
+      }
+      try { q.submission.url = await this.github.submitMergeQueue(record.snapshot, id); }
+      catch (error) {
+        if (error instanceof QueueSubmissionRejected) {
+          for (const [n, previous] of previousQueues) { const r = this.store.get(n)!; r.mergeQueue = previous.mergeQueue; r.decision = previous.decision; this.store.put(r); }
+          throw error;
+        }
+        q.submission.uncertain = true; q.error = "The submission response was interrupted. Check the request on GitHub before trying again."; this.store.put(record); throw error; }
+      this.store.put(record); this.store.audit("merge-queue-submitted", number, { id, head: record.snapshot.head, scope: eligibility.scope });
+      };
+      const hold = (index: number): Promise<void> => index === siblings.length ? submit() : this.withPR(siblings[index]!, () => hold(index + 1));
+      await hold(0); return;
+    }
+    if (action === "dismiss-queue-alert") {
+      if (input.head !== record.snapshot.head) throw Error("The PR changed. Refresh before dismissing this alert.");
+      if (record.mergeQueue?.terminal) record.mergeQueue.terminal.acknowledged = true;
+      record.decision = decide(record.snapshot, record); this.store.put(record); return;
+    }
     if (action === "request-approval") {
       if (!input.head) throw new Error("Include the PR head when requesting approval");
       await this.requestStamphog(record, input.head);
@@ -834,6 +903,8 @@ export class Controller {
       record.humanReason = "Agent interrupted by you. Open its session to take over, or start a new repair.";
       record.decision = { kind: "paused", reason: record.humanReason };
     } else if (action === "retry") {
+      if (record.mergeQueue?.active) throw Error("Remove this PR from Trunk before starting a repair.");
+      if (record.mergeQueue?.terminal) record.mergeQueue.terminal.acknowledged = true;
       if (this.github.canMaintain && !await this.github.canMaintain(record.snapshot)) throw new Error("Woodshed can only run agents on your own PRs. Open this PR on GitHub to review it.");
       if (input.message && input.message.length > 8000) throw new Error("Instructions must be at most 8000 characters");
       if (input.model !== undefined && !/^[a-zA-Z0-9._/-]{0,120}$/.test(input.model)) throw new Error("Invalid model");
@@ -877,14 +948,14 @@ export class Controller {
   }
   launchBudget(limit: number, number?: number): number {
     const records = this.store.all();
-    const runnable = records.filter(r => !r.job && !r.paused && r.watching !== false && r.skippedHead !== r.snapshot.head && r.snapshot.state === "OPEN" && !r.snapshot.draft && !stackBlock(r.snapshot, records, false) && (r.decision.kind === "fix" || r.decision.kind !== "human" && r.assessment && (!r.assessment.result || r.assessment.result.route === "repair")));
+    const runnable = records.filter(r => !mergeQueueDecision(r) && !r.job && !r.paused && r.watching !== false && r.skippedHead !== r.snapshot.head && r.snapshot.state === "OPEN" && !r.snapshot.draft && !stackBlock(r.snapshot, records, false) && (r.decision.kind === "fix" || r.decision.kind !== "human" && r.assessment && (!r.assessment.result || r.assessment.result.route === "repair")));
     const waiting = runnable.length + (number !== undefined && !runnable.some(r => r.snapshot.number === number) ? 1 : 0);
     const available = this.budgetAvailable();
     const contenders = Math.max(1, Math.min(this.capacity().limit - this.activeSlots(), waiting, Math.floor((available + 1e-9) / MIN_RUN_BUDGET)));
     return dollarsDown(Math.min(limit, available / contenders));
   }
   queueStatus(record: Record): { reason: string; message: string } | undefined {
-    if (record.job || record.paused || record.watching === false || record.snapshot.draft || record.snapshot.state !== "OPEN" || ["human", "ready", "closed"].includes(record.decision.kind) || record.stackWait) return undefined;
+    if (mergeQueueDecision(record) || record.job || record.paused || record.watching === false || record.snapshot.draft || record.snapshot.state !== "OPEN" || ["human", "ready", "closed"].includes(record.decision.kind) || record.stackWait) return undefined;
     if (record.decision.kind !== "fix" && !(record.assessment && (!record.assessment.result || record.assessment.result.route === "repair" && record.assessment.followups < 2))) return undefined;
     if (modeOf(this.config) === "paused") return { reason: "paused", message: "Waiting for automation to resume" };
     if (modeOf(this.config) !== "auto" && !record.runRequested && !record.assessment?.allowWatch) return undefined;

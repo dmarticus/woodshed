@@ -103,9 +103,11 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         guard record.snapshot.state == "OPEN" else { return nil }
         if record.snapshot.draft { return .drafts }
         if !record.isWatched { return .unwatched }
+        if record.mergeQueue?.active == true { return .mergeQueue }
         if record.paused || record.decision.kind == "paused" { return .paused }
         if record.decision.kind == "human" { return .attention }
         if record.job != nil, record.pendingReply == nil, lastRun(record)?.live ?? true { return .running }
+        if record.isReadyForQueue { return .ready }
         if record.decision.kind == "ready", record.readiness?.ready != false { return .ready }
         if record.pendingReply != nil || record.resumeRequested != nil || record.recovery?.retryAt != nil { return .queued }
         if record.queue != nil { return .queued }
@@ -117,12 +119,14 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     var attention: [PullRequestRecord] { records(in: .attention) }
     var ready: [PullRequestRecord] { records(in: .ready) }
     var running: [PullRequestRecord] { records(in: .running) }
+    var mergeQueuePRs: [PullRequestRecord] { records(in: .mergeQueue) }
     var queued: [PullRequestRecord] { records(in: .queued) }
     var waiting: [PullRequestRecord] { records(in: .waiting) }
     var pausedPRs: [PullRequestRecord] { records(in: .paused) }
     var unwatched: [PullRequestRecord] { records(in: .unwatched) }
     func listStatus(_ record: PullRequestRecord) -> String? {
         switch section(for: record) {
+        case .mergeQueue: return record.mergeQueue?.status
         case .waiting:
             if record.job == nil, record.decision.reason == "Coding agent is working" { return "Run status pending refresh" }
             if record.decision.kind == "ready" { return record.statusLabel }
@@ -309,6 +313,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         defer { pendingActions.removeValue(forKey: record.id) }
         prActionErrors.removeValue(forKey: record.id)
         var body: [String: Any] = ["head": headOverride ?? record.snapshot.head, "source": source]
+        if action == "submit-merge-queue", let heads = record.mergeQueueSubmission?.heads { body["queueHeads"] = heads }
         if let decisionId = decisionId ?? record.decision.id { body["decisionId"] = decisionId }
         if let questionKey = questionKey ?? record.decision.questionKey { body["questionKey"] = questionKey }
         if let runId = record.job?.name { body["runId"] = runId }
@@ -589,6 +594,11 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         do { try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)); track("scheduled", number: record.id, event: "notification"); return true }
         catch { track("failed", number: record.id, event: "notification"); actionError = "Couldn’t deliver a notification: \(error.localizedDescription)"; return false }
     }
+    func notificationVersion(_ record: PullRequestRecord) -> String {
+        if let queue = record.mergeQueue, queue.needsAttention, let terminal = queue.terminal { return "merge-queue:\(terminal.id)" }
+        if record.isReadyForQueue { return "merge-queue-ready:" + (record.mergeQueueSubmission?.heads.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",") ?? record.snapshot.head) }
+        return "\(record.snapshot.head):\(record.decision.kind):\(record.decision.id ?? record.decision.reason)"
+    }
     private func updateNotifications() async {
         guard !updatingNotifications else { return }
         updatingNotifications = true; defer { updatingNotifications = false }
@@ -610,7 +620,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         // disappearance must not turn the same question into a new notification.
         for record in records {
             let run = lastRun(record)
-            let version = "\(record.snapshot.head):\(record.decision.kind):\(record.decision.id ?? record.decision.reason)"
+            let version = notificationVersion(record)
             let key = String(record.id)
             guard seen[key] != version else { continue }
             guard notificationStability.ready(key, version: version) else {
@@ -624,10 +634,10 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
                 }
                 continue
             }
-            let category = record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : (record.decision.response == "reply" || record.decision.response == nil && record.decision.question != nil || run?.prompt?.kind == "question") ? "question" : "attention"
-            let delivered = await deliver(record, title: record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.decision.question ?? record.decision.reason, category: category, identifier: "pr-\(key)")
+            let category = record.isReadyForQueue || record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : (record.decision.response == "reply" || record.decision.response == nil && record.decision.question != nil || run?.prompt?.kind == "question") ? "question" : "attention"
+            let delivered = await deliver(record, title: record.isReadyForQueue ? "Ready for merge queue" : record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.isReadyForQueue ? "Review the included PRs in Woodshed, then submit them to Trunk when you are ready." : record.decision.question ?? record.decision.reason, category: category, identifier: "pr-\(key)")
             let current = ((notifyNeeds ? attention : []) + (notifyReady ? ready : [])).first { $0.id == record.id }
-            let currentVersion = current.map { "\($0.snapshot.head):\($0.decision.kind):\($0.decision.id ?? $0.decision.reason)" }
+            let currentVersion = current.map { notificationVersion($0) }
             if connected && currentVersion == version && delivered { seen[key] = version }
             else {
                 center.removeDeliveredNotifications(withIdentifiers: ["pr-\(key)"])
