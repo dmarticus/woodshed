@@ -106,6 +106,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         if record.job != nil, record.pendingReply == nil, lastRun(record)?.live ?? true { return .running }
         if record.decision.kind == "ready", record.readiness?.ready != false { return .ready }
         if record.pendingReply != nil || record.resumeRequested != nil || record.recovery?.retryAt != nil { return .queued }
+        if record.queue != nil { return .queued }
         if record.decision.kind == "fix", mode != .watch || record.runRequested == true { return .queued }
         return .waiting
     }
@@ -126,6 +127,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
             if record.decision.kind == "fix" { return "Repair needed in Watch mode · " + record.decision.reason }
             return record.decision.reason
         case .queued:
+            if let queue = record.queue { return queue.message }
             let reason = record.decision.reason
             let description = record.decision.kind == "fix" && !reason.hasPrefix("Queued") ? "Queued for repair · " + reason : reason
             return mode == .paused ? "New work is paused · " + description : description

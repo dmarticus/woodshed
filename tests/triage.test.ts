@@ -271,3 +271,18 @@ test("legacy provider-login asks refresh once with GitHub test diagnostics attac
   expect(reads).toBe(1); expect(h.launches()).toBe(1);
   await h.controller.reconcile(record.snapshot); expect(reads).toBe(1); expect(h.launches()).toBe(1);
 });
+
+
+test("resumed follow-ups share daily budget with other queued PRs without increasing their original cap", async () => {
+  const h = harness(); h.controller.config.dailyCapUSD = 4; h.controller.config.maxConcurrentJobs = 3;
+  h.runner.resume = async () => {};
+  for (const number of [43, 44]) { const snapshot = { ...pr(), number, branch: "feature-" + number }; snapshot.checks[0] = { ...snapshot.checks[0], conclusion: "FAILURE" }; h.store.put({ snapshot, paused: false, attempts: 0, fingerprint: fingerprint(snapshot), decision: { kind: "fix", reason: "Tests failed" } }); }
+  const record = h.store.get(42)!; record.humanHead = undefined;
+  const source = { name: "shared-budget-source", head: "abc", fingerprint: "", startedAt: new Date().toISOString(), adapter: "app-server" as const, budgetUSD: 5 };
+  h.store.saveRun({ id: source.name, number: 42, startedAt: source.startedAt, endedAt: source.startedAt, state: "stopped", model: "fixture", turns: 1, costUSD: 0.2, costsByDay: { [localDay()]: 0.2 }, summary: "Saved repair" });
+  record.assessment = { head: "abc", key: assessmentKey(record.snapshot), report: "Follow-up needed", sourceJob: source, attempts: 1, followups: 0, result: answer("repair") };
+  h.store.put(record); await h.controller.reconcile(record.snapshot);
+  expect(h.store.get(42)?.job?.budgetUSD).toBeCloseTo(1.46);
+  expect(h.store.run(source.name)?.budgetUSD).toBeCloseTo(1.46);
+  expect(h.controller.budgetAvailable()).toBeCloseTo(2.54);
+});

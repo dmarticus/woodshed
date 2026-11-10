@@ -143,6 +143,8 @@ Enrolling a PR does not change Watch, Auto, or Paused, and preserves a PR's exis
 
 ### Scheduling and readiness
 
+The controller runs independent PR repairs concurrently up to the configured limit. On a remote Linux host, CPU count and memory also bound the worker pool, reserving 1.5 GB for the system and 2 GB per worker. A 4 CPU, 8 GB host supports three workers. New starts wait when available memory falls below 2 GB or CPU load is high; existing runs keep running. Available daily budget is shared among runnable PRs rather than reserved entirely by the first job. New runs need at least $0.10. Queue messages identify worker, memory, CPU, or budget waits. Completed workers prompt scheduling immediately. Stack dependencies still wait for lower PRs.
+
 Tracked stacks are scheduled from the base upward. Repairs above a PR with active repairs, conflicts, checks, or unresolved threads wait for it to settle. An upper PR waits for its tracked base PR to merge before reporting readiness. An ordinary base movement does not trigger a rebase or restack; the existing GitHub conflict and required-update rules still decide when a branch needs updating. Dependencies are inferred only when a unique tracked open PR owns the base branch.
 
 A readiness report binds checks, reviews, mergeability, and the base to the observed PR commit. It expires after roughly two polling intervals, bounded to three to five minutes. Attached jobs, pending recovery or investigation, real human decisions, and refresh errors prevent readiness. The native detail view exposes this report; MCP can read its full evidence. It is evidence for a merge decision, never authorization to merge or enqueue.

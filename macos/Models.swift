@@ -195,6 +195,8 @@ struct PullRequestRecord: Decodable, Identifiable, Sendable {
         let result: Result?
     }
     struct Job: Decodable, Sendable { let name: String; let kind: String?; let startedAt: String; let model: String?; let adapter: String? }
+    struct QueueStatus: Decodable, Sendable { let reason: String; let message: String }
+    let queue: QueueStatus?
     let assessment: Assessment?
     let snapshot: Snapshot
     let canMarkReady: Bool?

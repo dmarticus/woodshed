@@ -14,6 +14,7 @@ import { SharedCI } from "./ci-incidents";
 import { Playbooks } from "./playbooks";
 import type { Analytics } from "./analytics";
 import { ProductAnalytics, type ActionSource } from "./product-analytics";
+import { workerCapacity, dollarsDown, MIN_RUN_BUDGET, type WorkerCapacity } from "./capacity";
 import { buildInfo } from "./build-info";
 
 export class Controller {
@@ -28,7 +29,7 @@ export class Controller {
   sleeping = false;
   health() {
     const records = this.store.all();
-    return { build: buildInfo, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
+    return { build: buildInfo, scheduler: { ...this.resources(this.config.maxConcurrentJobs), configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
   }
   power(event: "sleep" | "wake", confirmed = true): void {
     if (process.env.WOODSHED_REMOTE === "1" && confirmed) return;
@@ -70,7 +71,7 @@ export class Controller {
   readonly incidents: SharedCI;
   readonly playbooks: Playbooks;
   readonly telemetry?: ProductAnalytics;
-  constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics) {
+  constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number) => WorkerCapacity = workerCapacity) {
     this.incidents = new SharedCI(github, store, now); this.playbooks = new Playbooks(store); runner.onProgress = run => store.saveRun(run);
     if (analytics) this.telemetry = new ProductAnalytics(analytics, store, config, now);
   }
@@ -183,7 +184,7 @@ export class Controller {
       const run = await this.runner.telemetry(record.job);
       if (run) { this.store.saveRun(run); if (record.sleepInterruptedAt && run.updatedAt && Date.parse(run.updatedAt) > Date.parse(this.resumedAt ?? record.sleepInterruptedAt)) record.sleepInterruptedAt = undefined; }
     }
-    if (!observeOnly && record.resumeRequested && record.job && this.activeSlots(snapshot.number) < this.config.maxConcurrentJobs && modeOf(this.config) !== "paused") {
+    if (!observeOnly && record.resumeRequested && record.job && this.activeSlots(snapshot.number) < this.parallelLimit() && modeOf(this.config) !== "paused") {
       try { await this.runner.resume(record.job, record.resumeRequested); }
       catch (error) {
         const instructions = record.resumeRequested;
@@ -194,7 +195,7 @@ export class Controller {
       const resumed = this.store.run(record.job.name);
       if (resumed) { resumed.state = "running"; resumed.endedAt = undefined; resumed.prompt = undefined; this.store.saveRun(resumed); }
     }
-    if (!observeOnly && record.pendingReply && record.job && this.activeSlots(snapshot.number) < this.config.maxConcurrentJobs && modeOf(this.config) !== "paused") {
+    if (!observeOnly && record.pendingReply && record.job && this.activeSlots(snapshot.number) < this.parallelLimit() && modeOf(this.config) !== "paused") {
       record.job.afterTurn = await this.runner.send(record.job, record.pendingReply, record.pendingPromptId);
       record.job.startedAt = new Date().toISOString();
       record.pendingReply = undefined; record.pendingPromptId = undefined;
@@ -300,10 +301,10 @@ export class Controller {
         try {
           if (await this.requestStamphog(record, snapshot.head)) this.telemetry?.action(snapshot.number, "request-approval", "automation");
         } catch (error) { this.telemetry?.action(snapshot.number, "request-approval", "automation", true); throw error; }
-      } else if (record.decision.kind === "fix" && !record.job && this.activeSlots() < this.config.maxConcurrentJobs) {
-        const available = this.config.workerProtocol ? this.budgetAvailable() : Infinity;
+      } else if (record.decision.kind === "fix" && !record.job && this.activeSlots() < this.parallelLimit()) {
+        const available = this.config.workerProtocol ? this.launchBudget(this.config.runCapUSD ?? 5, snapshot.number) : Infinity;
         const limit = this.config.runCapUSD ?? 5;
-        if (available <= 0 || limit <= 0) {
+        if (available < MIN_RUN_BUDGET || limit <= 0) {
           const reached = this.store.spent(localDay()) >= (this.config.dailyCapUSD ?? 20) || limit <= 0 || this.store.spend(this.config.dailyCapUSD ?? 20).unknownRuns > 0;
           record.decision = { kind: reached ? "human" : "waiting", reason: reached ? "Spend limit reached or usage is unavailable. Review Spend settings before starting another run." : "Waiting for a run budget to free up" };
           if (reached) { record.humanHead = snapshot.head; record.humanReason = record.decision.reason; record.budgetDay = localDay(); }
@@ -420,7 +421,7 @@ export class Controller {
       if (run) { run.state = "waiting"; run.endedAt = undefined; this.store.saveRun(run); }
       return true;
     }
-    if (observeOnly || record.paused || this.activeSlots(pr.number) >= this.config.maxConcurrentJobs) return true;
+    if (observeOnly || record.paused || this.activeSlots(pr.number) >= this.parallelLimit()) return true;
     const run = await this.runner.telemetry?.(job) ?? this.store.run(job.name);
     const others = this.store.runs().filter(r => r.id !== job.name && !r.endedAt && ["preparing", "running", "waiting"].includes(r.state)).reduce((sum, r) => sum + Math.max(0, (r.budgetUSD ?? 0) - (r.costUSD ?? 0)), 0);
     const remaining = (job.budgetUSD ?? this.config.runCapUSD ?? 5) - (run?.costUSD ?? 0);
@@ -537,7 +538,7 @@ export class Controller {
         record.stackWait = stackBlock(pr, this.store.all(), false);
         if (record.stackWait) { record.decision = { kind: "waiting", reason: record.stackWait.reason }; return true; }
         const prepared = assessment.sourceJob;
-        if (!observeOnly && modeOf(this.config) === "auto" && this.activeSlots(pr.number) < this.config.maxConcurrentJobs && prepared?.kind === "branch-update" && /Resolution (?:edited files outside the conflict set|changed the automatic merge outside its conflicts)/.test(assessment.report) && this.runner.recoverPreparedUpdate) {
+        if (!observeOnly && modeOf(this.config) === "auto" && this.activeSlots(pr.number) < this.parallelLimit() && prepared?.kind === "branch-update" && /Resolution (?:edited files outside the conflict set|changed the automatic merge outside its conflicts)/.test(assessment.report) && this.runner.recoverPreparedUpdate) {
           try {
             if (await this.runner.recoverPreparedUpdate(prepared, pr)) {
               record.job = prepared; assessment.result = undefined; record.humanHead = undefined; record.humanReason = undefined; record.humanObservation = undefined; record.recovery = undefined;
@@ -552,20 +553,24 @@ export class Controller {
           return true;
         }
         record.decision = { kind: "waiting", reason: "Agent follow-up queued" };
-        if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.config.maxConcurrentJobs) return true;
+        if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.parallelLimit()) return true;
         const source = assessment.sourceJob;
         if (source?.head === pr.head && source.adapter === "app-server") {
           const run = this.store.run(source.name);
           const remaining = (source.budgetUSD ?? this.config.runCapUSD ?? 5) - (run?.costUSD ?? Infinity);
-          if (remaining > 0 && this.budgetAvailable() >= remaining) {
+          const allowance = this.launchBudget(remaining, pr.number);
+          if (allowance >= MIN_RUN_BUDGET) {
+            const previousBudget = source.budgetUSD;
             try {
+              source.budgetUSD = (run?.costUSD ?? 0) + allowance;
               await this.runner.resume(source, result.instructions!);
               record.job = source; record.humanHead = undefined;
-              if (run) { run.state = "running"; run.endedAt = undefined; run.prompt = undefined; this.store.saveRun(run); }
+              if (run) { run.budgetUSD = source.budgetUSD; run.state = "running"; run.endedAt = undefined; run.prompt = undefined; this.store.saveRun(run); }
               assessment.followups++; assessment.result = undefined;
               record.decision = { kind: "waiting", reason: "Agent is handling the verified follow-up" };
               return true;
             } catch (error) {
+              source.budgetUSD = previousBudget;
               this.store.log(pr.number, `Could not resume source run: ${String(error)}`);
               record.decision = { kind: "human", title: "Retry the saved repair", reason: "The original checkout is preserved, but its agent session could not resume.", question: "Open the saved run to recover its edits before starting another repair." };
               return true;
@@ -584,11 +589,16 @@ export class Controller {
       record.decision = { kind: "human", title: "Recheck this PR", reason: "Woodshed could not verify the escalation against GitHub after two attempts.", question: "Choose Recheck GitHub to try again, or open the PR to inspect it.", action: { label: "Open pull request", url: pr.url } };
       return true;
     }
-    if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.config.maxConcurrentJobs) return true;
+    if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.parallelLimit()) return true;
     const available = this.budgetAvailable();
-    const budget = Math.min(1, this.config.runCapUSD ?? 5, available);
-    if (budget <= 0) {
-      record.decision = { kind: "human", title: "Review the spend limit", reason: "No budget is available for the GitHub investigation.", question: "Review Spend settings to continue." }; record.budgetDay = localDay(); return true;
+    const budget = this.launchBudget(Math.min(1, this.config.runCapUSD ?? 5), pr.number);
+    if (budget < MIN_RUN_BUDGET) {
+      if (this.store.unfinishedRuns().some(r => ["preparing", "running", "waiting"].includes(r.state))) {
+        record.decision = { kind: "waiting", reason: "Waiting for reserved run budget to free up" };
+      } else {
+        record.decision = { kind: "human", title: "Review the spend limit", reason: "Less than $0.10 is available for another investigation.", question: "Review Spend settings to continue, or wait for the daily budget to reset." }; record.budgetDay = localDay();
+      }
+      return true;
     }
     const job: Job = { name: `ws-triage-${pr.number}-${randomUUID().slice(0, 8)}`, head: pr.head, fingerprint: record.fingerprint, startedAt: new Date().toISOString(), kind: "triage", model: this.config.defaultModel, budgetUSD: budget, adapter: "app-server" };
     record.job = job; assessment.attempts++;
@@ -763,7 +773,7 @@ export class Controller {
         record.decision = { kind: "waiting", reason: "Your answer is saved; reconnecting the original run" };
         this.store.put(record); return;
       }
-      if (this.activeSlots(number) >= this.config.maxConcurrentJobs || modeOf(this.config) === "paused") {
+      if (this.activeSlots(number) >= this.parallelLimit() || modeOf(this.config) === "paused") {
         record.pendingReply = input.message.trim(); record.pendingPromptId = input.promptId;
         record.decision = { kind: "waiting", reason: "Your reply is queued until a run slot is available" };
         this.store.put(record); return;
@@ -820,13 +830,38 @@ export class Controller {
     } catch (error) { this.telemetry?.action(number, action, source, true, this.now() - started); throw error; }
     finally { this.acting = false; if (this.telemetry) this.telemetry.actionContext = undefined; }
   }
+  parallelLimit(): number {
+    const capacity = this.resources(this.config.maxConcurrentJobs);
+    return capacity.blocked ? 0 : capacity.limit;
+  }
+  launchBudget(limit: number, number?: number): number {
+    const records = this.store.all();
+    const runnable = records.filter(r => !r.job && !r.paused && r.watching !== false && r.skippedHead !== r.snapshot.head && r.snapshot.state === "OPEN" && !r.snapshot.draft && !stackBlock(r.snapshot, records, false) && (r.decision.kind === "fix" || r.decision.kind !== "human" && r.assessment && (!r.assessment.result || r.assessment.result.route === "repair")));
+    const waiting = runnable.length + (number !== undefined && !runnable.some(r => r.snapshot.number === number) ? 1 : 0);
+    const available = this.budgetAvailable();
+    const contenders = Math.max(1, Math.min(this.parallelLimit() - this.activeSlots(), waiting, Math.floor((available + 1e-9) / MIN_RUN_BUDGET)));
+    return dollarsDown(Math.min(limit, available / contenders));
+  }
+  queueStatus(record: Record): { reason: string; message: string } | undefined {
+    if (record.job || record.paused || record.watching === false || record.snapshot.draft || record.snapshot.state !== "OPEN" || ["human", "ready", "closed"].includes(record.decision.kind) || record.stackWait) return undefined;
+    if (record.decision.kind !== "fix" && !(record.assessment && !record.assessment.result)) return undefined;
+    if (modeOf(this.config) === "paused") return { reason: "paused", message: "Waiting for automation to resume" };
+    if (modeOf(this.config) !== "auto" && !record.runRequested && !record.assessment?.allowWatch) return undefined;
+    const capacity = this.resources(this.config.maxConcurrentJobs);
+    if (capacity.blocked === "memory") return { reason: "memory", message: "Waiting for memory to free up on the server" };
+    if (capacity.blocked === "cpu") return { reason: "cpu", message: "Waiting for CPU capacity on the server" };
+    const active = this.activeSlots();
+    if (active >= capacity.limit) return { reason: "capacity", message: `Waiting for a worker · ${active} of ${capacity.limit} running` };
+    if (this.budgetAvailable() < MIN_RUN_BUDGET) return { reason: "budget", message: "Waiting for available spend budget" };
+    return { reason: "refresh", message: "Ready for repair · checking current PR state" };
+  }
   activeSlots(except?: number): number {
     return this.store.all().filter(r => r.snapshot.number !== except && r.job && !r.paused && r.watching !== false && !r.pendingReply && r.decision.kind !== "human" && ["preparing", "running"].includes(this.store.run(r.job.name)?.state ?? "running")).length;
   }
   budgetAvailable(): number {
     if (this.store.spend(this.config.dailyCapUSD ?? 20).unknownRuns) return 0;
-    const reserved = this.store.runs().filter(r => !r.endedAt && ["preparing", "running", "waiting"].includes(r.state)).reduce((sum, r) => sum + Math.max(0, (r.budgetUSD ?? 0) - (r.costUSD ?? 0)), 0);
-    return Math.max(0, (this.config.dailyCapUSD ?? 20) - this.store.spent(localDay()) - reserved);
+    const reserved = this.store.unfinishedRuns().filter(r => ["preparing", "running", "waiting"].includes(r.state)).reduce((sum, r) => sum + Math.max(0, (r.budgetUSD ?? 0) - (r.costUSD ?? 0)), 0);
+    return dollarsDown((this.config.dailyCapUSD ?? 20) - this.store.spent(localDay()) - reserved);
   }
   initialRun(job: Job, number: number): Run {
     return { id: job.name, number, model: "No model", startedAt: job.startedAt, state: "preparing", turns: 0, costUSD: 0, costsByDay: {}, summary: "Preparing the PR checkout", budgetUSD: job.budgetUSD };
@@ -843,10 +878,15 @@ export class Controller {
   async checkBudgets(): Promise<void> {
     if (this.budgetChecking || this.acting || this.syncing || this.refreshingAttention) return;
     this.budgetChecking = true;
+    let freedSlot = false;
     try {
       for (const record of this.store.all().filter(r => r.job?.adapter === "app-server")) {
         const run = await this.runner.telemetry(record.job!);
-        if (run) this.store.saveRun(run);
+        if (run) {
+          const previous = this.store.run(run.id);
+          if (previous && ["preparing", "running"].includes(previous.state) && !["preparing", "running"].includes(run.state)) freedSlot = true;
+          this.store.saveRun(run);
+        }
       }
       {
         const dailyReached = this.store.spent(localDay()) >= (this.config.dailyCapUSD ?? 20);
@@ -856,11 +896,13 @@ export class Controller {
           if (!dailyReached && (run.costUSD ?? 0) < (record.job!.budgetOverride ? run.budgetUSD ?? Infinity : Math.min(run.budgetUSD ?? Infinity, this.config.runCapUSD ?? 5))) continue;
           await this.runner.stop(record.job!);
           await this.finishRun(record.job!, record.snapshot.number, "budget", dailyReached ? "Daily spend cap reached" : "Run spend cap reached");
+          freedSlot = true;
           record.humanHead = record.snapshot.head; record.humanReason = dailyReached ? "The daily spend cap is reached. Review the daily cap in Spend settings, or stop the run." : "This run reached its spending limit. Add $1.00 to continue within the daily cap, or stop the run.";
           record.decision = { kind: "human", reason: record.humanReason }; record.budgetDay = localDay();
           this.store.put(record);
         }
       }
     } finally { this.budgetChecking = false; }
+    if (freedSlot) void this.sync();
   }
 }

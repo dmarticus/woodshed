@@ -166,6 +166,14 @@ struct InteractionSmoke {
         attentionData["decision"] = ["kind": "human", "reason": "Access is missing", "response": "recheck", "question": "Sign in to the CI provider and recheck"]
         attentionData["assessment"] = ["result": ["route": "ask", "title": "Connect CI", "evidence": []]]
         func attentionRecord() throws -> PullRequestRecord { try JSONDecoder().decode(PullRequestRecord.self, from: JSONSerialization.data(withJSONObject: attentionData)) }
+        attentionData["snapshot"] = (base["snapshot"] as! [String: Any]).merging(["draft": false]) { _, next in next }
+        attentionData["paused"] = false; attentionData.removeValue(forKey: "job")
+        attentionData["queue"] = ["reason": "capacity", "message": "Waiting for a worker · 3 of 3 running"]
+        attentionData["decision"] = ["kind": "fix", "reason": "1 failing check"]
+        let queuedRepair = try attentionRecord()
+        precondition(model.section(for: queuedRepair) == .queued && model.listStatus(queuedRepair) == "Waiting for a worker · 3 of 3 running", "Show the actual queue blocker instead of repeating failed-check counts")
+        attentionData.removeValue(forKey: "queue")
+        attentionData["decision"] = ["kind": "human", "reason": "Access is missing", "response": "recheck", "question": "Sign in to the CI provider and recheck"]
         let externalAction = try attentionRecord()
         precondition(!model.needsAnswer(externalAction), "An external action must not offer a question reply")
         attentionData["decision"] = ["kind": "human", "reason": "Choose an approach", "response": "reply"]
