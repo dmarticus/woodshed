@@ -150,7 +150,7 @@ export class GitHub {
     for (let offset = 0; offset < numbers.length; offset += 5) {
       const batch = numbers.slice(offset, offset + 5);
       if (batch.some(n => !Number.isSafeInteger(n) || n <= 0)) throw new Error("Invalid PR number");
-      const selections = batch.map(n => `p${n}:pullRequest(number:${n}){number title url headRefOid headRefName baseRefName baseRefOid state isDraft mergeable mergeStateStatus reviewDecision body updatedAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}} reviewRequests(first:100){nodes{requestedReviewer{...on User{login} ...on Team{name slug}}} pageInfo{hasNextPage}} reviewThreads(first:20){nodes{id isResolved comments(first:10){nodes{author{login __typename} body url} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}} reviews(first:30){nodes{author{login} state body commit{oid} submittedAt} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{...on CheckRun{isRequired(pullRequestNumber:${n}) name status conclusion detailsUrl startedAt checkSuite{workflowRun{id createdAt workflow{id}}}} ...on StatusContext{isRequired(pullRequestNumber:${n}) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`).join(" ");
+      const selections = batch.map(n => `p${n}:pullRequest(number:${n}){number title url headRefOid headRefName baseRefName baseRefOid state isDraft mergeable mergeStateStatus reviewDecision body updatedAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}} reviewRequests(first:100){nodes{requestedReviewer{...on User{login} ...on Team{name slug}}} pageInfo{hasNextPage}} reviewThreads(first:20){nodes{id path isResolved comments(first:10){nodes{author{login __typename} body url} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}} reviews(first:30){nodes{author{login} state body commit{oid} submittedAt} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{...on CheckRun{isRequired(pullRequestNumber:${n}) name status conclusion detailsUrl startedAt checkSuite{workflowRun{id createdAt workflow{id}}}} ...on StatusContext{isRequired(pullRequestNumber:${n}) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`).join(" ");
       const result = JSON.parse(await this.request(["gh", "api", "graphql", "-f", `query=query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${selections}}}`]));
       if (result.errors) throw new Error("GitHub batch query failed: " + JSON.stringify(result.errors));
       for (const n of batch) {
@@ -232,7 +232,7 @@ export class GitHub {
       } while (cursor);
       return rows;
     };
-    const threads = await pages("reviewThreads", "id isResolved comments(first:100){nodes{author{login __typename} body url} pageInfo{hasNextPage}}", ["reviewThreads"]);
+    const threads = await pages("reviewThreads", "id path isResolved comments(first:100){nodes{author{login __typename} body url} pageInfo{hasNextPage}}", ["reviewThreads"]);
     if (threads.some(t => !t.isResolved && t.comments.pageInfo.hasNextPage)) throw new Error("A review thread exceeds 100 comments; open it manually before automation continues.");
     const reviews = await pages("reviews", "author{login} state body commit{oid} submittedAt", ["reviews"]);
     let cursor: string | null = null;
@@ -265,7 +265,7 @@ export class GitHub {
       number, title: pr.title, url: pr.url, head: pr.headRefOid, branch: pr.headRefName, base: pr.baseRefName, baseHead: pr.baseRefOid,
       state: pr.state, draft: pr.isDraft, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus,
       reviewDecision: pr.reviewDecision, labels: pr.labels.map((l: any) => l.name), checks: currentChecks(checks),
-      threads: threads.filter(t => !t.isResolved).map(t => ({ id: t.id, comments: t.comments.nodes.map((c: any) => ({ author: c.author?.login ?? "deleted", authorType: c.author?.__typename, body: c.body, url: c.url })) })),
+      threads: threads.filter(t => !t.isResolved).map(t => ({ id: t.id, path: t.path, comments: t.comments.nodes.map((c: any) => ({ author: c.author?.login ?? "deleted", authorType: c.author?.__typename, body: c.body, url: c.url })) })),
       reviews: reviews.map(r => ({ author: r.author?.login ?? "deleted", state: r.state, body: r.body, head: r.commit?.oid ?? "", submittedAt: r.submittedAt })),
       author: pr.author?.login,
       body: pr.body, updatedAt: pr.updatedAt, reviewRequests: (pr.reviewRequests ?? []).map((r: any) => r.login ?? r.name ?? r.slug).filter(Boolean),

@@ -1,3 +1,4 @@
+import { Outcomes } from "./outcomes";
 import { randomUUID } from "node:crypto";
 import { approvalRequestState, hasRequestedApproval, stamphogRefused, decide, fingerprint, modeOf, repairResolved, failed, type Config, type Record, type Snapshot, type Job, type Run } from "./model";
 import { localDay } from "./usage";
@@ -76,10 +77,13 @@ export class Controller {
       return { handoff, replayed: false };
     });
   }
+  readonly outcomes: Outcomes;
   readonly incidents: SharedCI;
   readonly playbooks: Playbooks;
   readonly telemetry?: ProductAnalytics;
   constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number, policy?: CapacityPolicy) => WorkerCapacity = workerCapacity) {
+    this.outcomes = new Outcomes(store, config, () => github.viewerName, now);
+    store.localHistory = this.outcomes;
     this.incidents = new SharedCI(github, store, now); this.playbooks = new Playbooks(store); runner.onProgress = run => store.saveRun(run);
     if (analytics) this.telemetry = new ProductAnalytics(analytics, store, config, now);
   }
@@ -273,6 +277,7 @@ export class Controller {
         record.job = undefined;
         if (record.assessment && result.state === "triaged" && result.assessment?.head === snapshot.head) {
           record.assessment.result = result.assessment;
+          this.outcomes.triage(record, result.assessment);
           this.store.audit("triage-outcome", snapshot.number, { assessmentId: record.assessment.id, head: snapshot.head, job: job.name, route: result.assessment.route, followups: record.assessment.followups });
           record.assessment.key = assessmentKey(snapshot);
           if (!record.assessment.jevChecked && this.budgetAvailable() >= 0.01) {
@@ -294,12 +299,14 @@ export class Controller {
           }
         }
       } else if ((result.state === "human" || result.state === "completed") && this.runner.launchTriage) {
+        if (result.state === "completed") this.outcomes.notPublished(record.job);
         await this.queueAssessment(record, result.reason ?? "Run completed; verify any remaining blocker");
       } else if (result.state === "human") {
         record.humanHead = snapshot.head; record.humanReason = result.reason;
         record.humanObservation = await this.runner.observe?.(record.job);
       } else if (result.state === "published") {
         this.playbooks.published(snapshot.number, record.job, result);
+        this.outcomes.published(record, record.job, result);
         this.store.log(snapshot.number, result.reason ?? "Agent published changes");
         await this.finishRun(record.job, snapshot.number, "succeeded", result.reason ?? "Run completed");
         record.job = undefined;
@@ -631,6 +638,7 @@ export class Controller {
             try {
               source.budgetUSD = (run?.costUSD ?? 0) + allowance;
               this.admitted(); await this.runner.resume(source, result.instructions!);
+              this.outcomes.repairRound(record, source, `followup:${assessment.id}:${assessment.followups + 1}`);
               record.job = source; record.humanHead = undefined;
               if (run) { run.budgetUSD = source.budgetUSD; run.state = "running"; run.endedAt = undefined; run.prompt = undefined; this.store.saveRun(run); }
               assessment.followups++; assessment.result = undefined;

@@ -20,6 +20,7 @@ export function handler(controller: Controller, settings: Settings, token = rand
       if (request.method === "GET" && url.pathname === "/health") return json(controller.health());
       if (request.method === "GET" && url.pathname === "/api/events") { events.publish(publicState(controller, settings)); return events.response(); }
       if (request.method === "GET" && url.pathname === "/api/state") return json(publicState(controller, settings));
+      if (request.method === "GET" && url.pathname === "/api/agent/outcomes") return json(agentAPI.outcomes(url.searchParams.get("since") ?? "14d", url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 50));
       if (request.method === "GET" && url.pathname === "/api/agent/inbox") return json(agentAPI.inbox());
       if (request.method === "GET" && url.pathname === "/api/agent/attention") return json(agentAPI.attention());
       if (request.method === "GET" && url.pathname === "/api/agent/playbooks") return json({ playbooks: controller.playbooks.catalog() });

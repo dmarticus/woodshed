@@ -6,7 +6,7 @@ const auth = { Authorization: `Bearer ${token}` };
 const base = process.env.WOODSHED_URL ?? "http://127.0.0.1:7341";
 function assert(ok: unknown, message: string): asserts ok { if (!ok) throw new Error(message); }
 const state = await fetch(`${base}/api/state`, { headers: auth }).then(r => r.json());
-assert(state.demo && !state.automation && state.prs.length === 4, "Expected demo data with automation disabled");
+assert(state.demo && !state.automation && state.prs.filter((p: any) => p.snapshot.state === "OPEN").length === 4, "Expected demo data with automation disabled");
 const root = await fetch(base, {headers:auth});
 assert(root.status === 200 && (await root.json()).interface === "macOS menu bar", "Expected native controller status");
 assert((await fetch(`${base}/app.js`, {headers:auth})).status === 404, "Web UI must no longer be served");

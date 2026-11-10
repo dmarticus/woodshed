@@ -334,3 +334,12 @@ test("a new commit supersedes an owner escalation and a changed relevant thread 
     expect(h.store.get(42)!.decision.kind).not.toBe("human");
   }
 });
+
+
+test("triage finding metadata stays backward compatible and validates optional categories and current-head evidence", () => {
+  const head = "a".repeat(40); const base = { ...answer("repair"), head, category: "review", review_threads: [{ id: "thread", status: "needs_repair", reason: "A failed provider response bypasses error handling." }] };
+  expect(parseAssessment(base, head).review_threads?.[0]?.category).toBeUndefined();
+  expect(parseAssessment({ ...base, review_threads: [{ ...base.review_threads[0], category: "error_handling", code_url: `https://github.com/example/project/blob/${head}/src/api.py` }] }, head, undefined, "example/project").review_threads?.[0]?.category).toBe("error_handling");
+  expect(() => parseAssessment({ ...base, review_threads: [{ ...base.review_threads[0], category: "invented" }] }, head)).toThrow();
+  expect(() => parseAssessment({ ...base, review_threads: [{ ...base.review_threads[0], code_url: `https://github.com/other/project/blob/${head}/src/api.py` }] }, head, undefined, "example/project")).toThrow();
+});

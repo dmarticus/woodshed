@@ -9,6 +9,7 @@ import type { Handoff } from "./handoff";
 export class Store {
   db: Database;
   onChange?: () => void;
+  localHistory?: { record(record: Record): void; run(run: Run): void; audit(kind: string, number: number, data: any): void };
   observer?: { record: (record: Record, previous?: Record) => void; run: (run: Run, previous?: Run) => void };
   private observe(work: () => void): void { try { work(); } catch { /* Optional analytics never interrupts persistence. */ } }
   private listeners = new Set<() => void>();
@@ -22,6 +23,10 @@ export class Store {
     this.db.exec("CREATE TABLE IF NOT EXISTS handoffs (request_id TEXT PRIMARY KEY, data TEXT NOT NULL)");
     this.db.exec("CREATE TABLE IF NOT EXISTS automation_actions (key TEXT PRIMARY KEY, data TEXT NOT NULL)");
     this.db.exec("CREATE TABLE IF NOT EXISTS audits (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, number INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL)");
+    this.db.exec("CREATE TABLE IF NOT EXISTS outcome_handoffs (request_id TEXT PRIMARY KEY, repository TEXT NOT NULL, author TEXT NOT NULL, number INTEGER NOT NULL, received_at TEXT NOT NULL, data TEXT NOT NULL)");
+    this.db.exec("CREATE TABLE IF NOT EXISTS outcomes (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, time TEXT NOT NULL, kind TEXT NOT NULL, dedupe TEXT NOT NULL UNIQUE, data TEXT NOT NULL)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS outcomes_request_kind ON outcomes(request_id,kind,id); CREATE INDEX IF NOT EXISTS outcome_handoffs_scope ON outcome_handoffs(repository,author,received_at)");
+    this.db.exec("CREATE TABLE IF NOT EXISTS outcome_runs (run TEXT PRIMARY KEY, request_id TEXT NOT NULL, data TEXT NOT NULL)");
     const noTurnRuns = this.db.query("SELECT data FROM runs WHERE json_extract(data,'$.costUSD') IS NULL AND json_extract(data,'$.turns')=0 AND json_extract(data,'$.endedAt') IS NOT NULL").all() as { data: string }[];
     for (const row of noTurnRuns) {
       const run = JSON.parse(row.data) as Run;
@@ -40,13 +45,17 @@ export class Store {
     this.db.transaction(() => {
       this.db.query("INSERT INTO handoffs VALUES (?,?)").run(handoff.request_id, JSON.stringify(handoff));
       this.db.query("INSERT INTO prs VALUES (?,?) ON CONFLICT(number) DO UPDATE SET data=excluded.data").run(record.snapshot.number, JSON.stringify(record));
+      this.localHistory?.record(record);
     })();
     this.observe(() => this.observer?.record(record, previous));
     this.changed();
   }
   audit(kind: string, number: number, data: unknown): void {
     this.db.exec("CREATE TABLE IF NOT EXISTS audits (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, number INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL)");
-    this.db.query("INSERT INTO audits(time,number,kind,data) VALUES(?,?,?,?)").run(new Date().toISOString(), number, kind, JSON.stringify(data));
+    this.db.transaction(() => {
+      this.db.query("INSERT INTO audits(time,number,kind,data) VALUES(?,?,?,?)").run(new Date().toISOString(), number, kind, JSON.stringify(data));
+      this.localHistory?.audit(kind, number, data);
+    })();
   }
   all(): Record[] { return this.db.query("SELECT data FROM prs ORDER BY number DESC").all().map((row: any) => JSON.parse(row.data)); }
   get(number: number): Record | undefined {
@@ -56,7 +65,10 @@ export class Store {
   put(record: Record): void {
     const previous = this.observer ? this.get(record.snapshot.number) : undefined;
     bindDecision(record);
-    this.db.query("INSERT INTO prs VALUES (?, ?) ON CONFLICT(number) DO UPDATE SET data=excluded.data").run(record.snapshot.number, JSON.stringify(record));
+    this.db.transaction(() => {
+      this.db.query("INSERT INTO prs VALUES (?, ?) ON CONFLICT(number) DO UPDATE SET data=excluded.data").run(record.snapshot.number, JSON.stringify(record));
+      this.localHistory?.record(record);
+    })();
     this.observe(() => this.observer?.record(record, previous));
     this.changed();
   }
@@ -70,6 +82,7 @@ export class Store {
     this.db.transaction(() => {
       this.db.query("INSERT INTO runs VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data").run(run.id, run.number, run.startedAt, JSON.stringify(run));
       this.db.query("INSERT OR IGNORE INTO usage_days VALUES (?,?,0)").run(run.id, localDay(new Date(run.startedAt)));
+      this.localHistory?.run(run);
       for (const [day, cost] of Object.entries(run.costsByDay)) this.db.query("INSERT INTO usage_days VALUES (?,?,?) ON CONFLICT(run,day) DO UPDATE SET cost=excluded.cost").run(run.id, day, cost);
     })();
     this.observe(() => this.observer?.run(run, previous));

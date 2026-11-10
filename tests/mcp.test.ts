@@ -97,3 +97,17 @@ test("agent endpoints require the local credential and the MCP bridge refuses ex
   }
   for (const url of ["https://example.com", "http://127.0.0.1:7341@evil.example", "http://127.0.0.1:7341/?token=value"]) expect(() => new ControllerClient(url)).toThrow();
 });
+
+
+test("outcome resources are discoverable, bounded, historical and support a since template", async () => {
+  const h = harness(); h.controller.github.viewerName = "fixture"; await h.controller.handoff(h.handoff);
+  const server = createMcpServer(h.client); const client = new Client({ name: "fixture", version: "1" });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b); close.push(async () => { await client.close(); await server.close(); });
+  expect((await client.listResources()).resources.some(r => r.uri === "woodshed://outcomes" && r.description?.includes("Not a rule set"))).toBe(true);
+  expect((await client.listTools()).tools.find(t => t.name === "handoff-pr")?.description).toContain("woodshed://outcomes");
+  for (const uri of ["woodshed://outcomes", "woodshed://outcomes?since=7d"]) {
+    const result = await client.readResource({ uri }); const text = (result.contents[0] as any).text;
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(16384); expect(JSON.parse(text)).toMatchObject({ historical_context_only: true, totals: { prs_handed_off: 1 } });
+  }
+  await expect(h.client.request("api/agent/outcomes?since=invalid")).rejects.toThrow();
+});

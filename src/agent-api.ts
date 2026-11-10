@@ -44,6 +44,7 @@ export class AgentAPI {
     if (!record) throw new Error("PR is not watched by Woodshed");
     return readiness(record, this.controller.config, this.controller.store.all(), this.controller.store.runs(), this.now());
   }
+  outcomes(since = "14d", limit = 50) { return this.controller.outcomes.digest(since, limit); }
   attention() {
     return { repository: this.controller.config.repository, items: this.controller.store.all().filter(r => r.snapshot.state === "OPEN" && r.watching !== false && !r.paused && r.decision.kind === "human").map(r => this.status(r.snapshot.number)) };
   }

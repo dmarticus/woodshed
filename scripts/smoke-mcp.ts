@@ -35,5 +35,7 @@ try {
   await client.readResource({ uri: `woodshed://prs/${number}` });
   await client.readResource({ uri: `woodshed://prs/${number}/readiness` });
   await client.readResource({ uri: "woodshed://playbooks" });
+  const outcomes = await client.readResource({ uri: "woodshed://outcomes" });
+  if (Buffer.byteLength((outcomes.contents[0] as any).text) > 16384) throw Error("Outcome digest exceeds its response bound");
   console.log(JSON.stringify({ passed: true, live, tools, number, phase: data.phase, stale: data.stale, structuredStatus: true, boundedWait: true, resource: true }));
 } finally { await client.close(); controller?.kill(); if (controller) await controller.exited; }

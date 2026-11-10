@@ -1,6 +1,6 @@
 import { resolve, isAbsolute } from "node:path";
 import { Controller } from "./controller";
-import { demoRecords } from "./demo";
+import { demoRecords, seedDemoOutcomes } from "./demo";
 import { GitHub } from "./github";
 import { Runner } from "./runner";
 import { Store } from "./store";
@@ -21,6 +21,7 @@ const config: Config = {
   repository: "PostHog/posthog", author: "@me", checkout: "", pollSeconds: 90, maxAttempts: 3,
   maxConcurrentJobs: 1, automation: false, port: 7341, reviewLabel: "posthog-review", approvalLabel: "stamphog", runCapUSD: 5, dailyCapUSD: 20, workerProtocol: "app-server", defaultModel: "gpt-6.1-terra", ...supplied,
 };
+if (demo) config.repository = "example/project";
 if (!config.defaultModel) config.defaultModel = "gpt-6.1-terra";
 config.mode = demo ? "watch" : modeOf(config);
 config.automation = config.mode === "auto"; config.paused = config.mode === "paused";
@@ -40,6 +41,7 @@ const store = new Store(demo ? ":memory:" : resolve(root, ".woodshed", "state.sq
 if (demo) demoRecords().forEach(r => store.put(r));
 const analytics = new Analytics(resolve(root, ".woodshed"), { enabled: !demo });
 const controller = new Controller(config, store, new GitHub(config), new Runner(config, resolve(root, ".woodshed")), Date.now, analytics);
+if (demo) { controller.github.viewerName = "demo"; seedDemoOutcomes(store, config); }
 const settings = new Settings(config, configPath, demo);
 if (!demo) await controller.prepareAttention();
 if (!demo) analytics.capture("woodshed_started", { mode: config.mode, component: "controller", remote: process.env.WOODSHED_REMOTE === "1" });

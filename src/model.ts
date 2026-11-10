@@ -1,6 +1,6 @@
 import { mergeQueueDecision, queueCheck } from "./merge-queue";
 export type Check = { app?: string; required?: boolean; name: string; status: string; conclusion: string | null; url: string; description?: string; startedAt?: string; source?: { workflow: string; run: string; createdAt: string } };
-export type Thread = { id: string; comments: { author: string; authorType?: string; body: string; url: string }[] };
+export type Thread = { id: string; path?: string; comments: { author: string; authorType?: string; body: string; url: string }[] };
 export type Review = { author: string; state: string; body: string; head: string; submittedAt: string };
 export type Snapshot = {
   number: number; title: string; url: string; head: string; branch: string; base: string;
@@ -20,7 +20,7 @@ export type Decision = {
   options?: { id: string; label: string; value: string }[];
 };
 export type Job = { name: string; head: string; fingerprint: string; startedAt: string; kind?: "repair" | "branch-update" | "triage"; instructions?: string; afterTurn?: number; model?: string; budgetUSD?: number; adapter?: "app-server"; budgetOverride?: boolean; manual?: boolean; freshCheckout?: boolean; handoff?: import("./handoff").Handoff; ciEvidence?: import("./check-evidence").CIEvidence; repairHints?: import("./playbooks").RepairHint[]; playbooksApplied?: string[] };
-export type ReviewThreadAssessment = { id: string; status: "addressed" | "needs_repair" | "awaiting_reviewer"; reason: string; code_url?: string };
+export type ReviewThreadAssessment = { id: string; status: "addressed" | "needs_repair" | "awaiting_reviewer"; reason: string; category?: import("./outcomes").FindingCategory; code_url?: string };
 export type AssessmentResult = { head: string; route: "wait" | "repair" | "ask" | "ready"; category: "review" | "checks" | "visual" | "product" | "operations" | "internal"; response?: "reply" | "recheck"; ci_access?: import("./check-evidence").CIAccessBlocker; title: string; reason: string; question?: string; options?: { id: string; label: string; value: string }[]; instructions?: string; action?: { label: string; url: string }; evidence: { url: string; detail: string }[]; review_threads?: ReviewThreadAssessment[] };
 export type Assessment = { id?: string; head: string; key: string; report: string; sourceJob?: Job; attempts: number; result?: AssessmentResult; reply?: string; followups: number; jevChecked?: boolean; allowWatch?: boolean; attentionVersion?: number; ciEvidenceVersion?: number; ciEvidence?: import("./check-evidence").CIEvidence; attention?: import("./owner-attention").OwnerAttention };
 export type Record = {
