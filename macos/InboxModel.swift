@@ -547,7 +547,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     // plain values in its callback instead of moving the object onto MainActor.
     private func notificationAuthorization() async -> (notDetermined: Bool, denied: Bool, authorized: Bool) {
         await withCheckedContinuation { continuation in
-            UNUserNotificationCenter.current().getNotificationSettings { settings in
+            UNUserNotificationCenter.current().getNotificationSettings { @Sendable settings in
                 continuation.resume(returning: (
                     settings.authorizationStatus == .notDetermined,
                     settings.authorizationStatus == .denied,

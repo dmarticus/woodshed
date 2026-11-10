@@ -18,7 +18,7 @@ else
   done
   if [ "${CI:-}" = "true" ]; then
     /usr/bin/log show --last 2m --predicate 'process == "InteractionSmoke"' --style compact | tail -80 || true
-    xcrun lldb --batch -o run -o 'thread backtrace all' -- .woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json || true
+    xcrun lldb --batch -o run -k 'thread backtrace all' -- .woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json || true
   fi
   exit "$status"
 fi
