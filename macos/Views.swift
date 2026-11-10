@@ -588,7 +588,18 @@ struct RunComposer: View {
                 TextEditor(text: draft).focused(focus).scrollContentBackground(.hidden).frame(height: 76).font(.body).accessibilityLabel(isReply ? "Your answer" : "Run instructions")
             }
             HStack {
-                if !isReply { Menu("Run options") { Picker("Model", selection: $selectedModel) { Text("Default · " + model.defaultModelName).tag(""); ForEach((model.state?.models ?? []).filter { $0.id != model.state?.settings?.defaultModel }) { Text($0.name).tag($0.id) } }.pickerStyle(.inline) }.menuStyle(.borderlessButton).fixedSize() }
+                if !isReply {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Menu("Model options") {
+                            Picker("Model", selection: $selectedModel) {
+                                Text("Default · " + model.defaultModelName).tag("")
+                                ForEach((model.state?.models ?? []).filter { $0.id != model.state?.settings?.defaultModel }) { Text($0.name).tag($0.id) }
+                            }.pickerStyle(.inline)
+                        }.menuStyle(.borderlessButton).fixedSize()
+                        Text(selectedModel.isEmpty ? "Default · " + model.defaultModelName : model.modelName(selectedModel))
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
                 Spacer()
                 if model.actionPending { ProgressView().controlSize(.small) }
                 Button(isReply ? "Send reply" : record.decision.response == "retry" ? "Retry repair" : record.job == nil ? "Start repair" : "Restart with these instructions") {

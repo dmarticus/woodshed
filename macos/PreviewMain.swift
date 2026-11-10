@@ -18,6 +18,7 @@ struct NativePreview {
         let content: AnyView
         let size: NSSize
         switch mode {
+        case "composer": content = AnyView(RunComposerPreview(model: model)); size = NSSize(width: width, height: 210)
         case "menu": content = AnyView(MenuContent(model: model)); size = NSSize(width: 370, height: 600)
         case "main", "busy", "bulk", "activity": content = AnyView(MainView(model: model)); size = NSSize(width: width, height: 650)
         case "sidebar": content = AnyView(PRSidebar(model: model)); size = NSSize(width: 260, height: 650)
@@ -49,5 +50,14 @@ struct NativePreview {
             catch { print(error); exit(1) }
         }
         NSApp.run()
+    }
+}
+
+@MainActor
+private struct RunComposerPreview: View {
+    @ObservedObject var model: InboxModel
+    @FocusState private var focused: Bool
+    var body: some View {
+        if let record = model.state?.prs.first { RunComposer(record: record, model: model, focus: $focused).padding(20) }
     }
 }
