@@ -1,4 +1,5 @@
-import { Outcomes } from "./outcomes";
+import { MergedDecisions, type DecisionRepository } from "./merged-decisions";
+import { Outcomes, repositoryPath } from "./outcomes";
 import { randomUUID } from "node:crypto";
 import { approvalRequestState, hasRequestedApproval, stamphogRefused, decide, fingerprint, modeOf, repairResolved, failed, type Config, type Record, type Snapshot, type Job, type Run } from "./model";
 import { localDay } from "./usage";
@@ -78,12 +79,19 @@ export class Controller {
     });
   }
   readonly outcomes: Outcomes;
+  readonly decisions: MergedDecisions;
   readonly incidents: SharedCI;
   readonly playbooks: Playbooks;
   readonly telemetry?: ProductAnalytics;
-  constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number, policy?: CapacityPolicy) => WorkerCapacity = workerCapacity) {
+  constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number, policy?: CapacityPolicy) => WorkerCapacity = workerCapacity, decisionRepository: DecisionRepository = github) {
     this.outcomes = new Outcomes(store, config, () => github.viewerName, now);
-    store.localHistory = this.outcomes;
+    this.decisions = new MergedDecisions(store, config, decisionRepository, () => github.viewerName, now);
+    store.localHistory = { record: r => { this.outcomes.record(r); this.decisions.observe(r); }, run: r => this.outcomes.run(r), audit: (kind, number, data) => this.outcomes.audit(kind, number, data) };
+    runner.decisionContextFor = async (pr, paths, job) => {
+      if (!this.decisions.hasHistory()) return { records: [], omitted_records: 0 };
+      const scope = paths ?? [...await decisionRepository.changedFiles(pr.number).catch(() => []), ...pr.threads.flatMap(t => t.path ? [t.path] : []), ...(job?.ciEvidence?.reports.flatMap(r => r.annotations.map(a => a.path)) ?? [])];
+      return this.decisions.forPaths(scope.filter(path => path.length <= 500 && repositoryPath(path) !== null), true);
+    };
     this.incidents = new SharedCI(github, store, now); this.playbooks = new Playbooks(store); runner.onProgress = run => store.saveRun(run);
     if (analytics) this.telemetry = new ProductAnalytics(analytics, store, config, now);
   }
@@ -298,6 +306,12 @@ export class Controller {
             } catch { this.store.log(snapshot.number, "Optional TypeSafe routing check unavailable; using the GitHub investigation"); }
           }
         }
+      } else if (result.state === "decision-context") {
+        record.resumeRequested = result.reason;
+        record.decision = { kind: "waiting", reason: "Reviewing historical tradeoffs before publishing" };
+        const run = this.store.run(record.job.name);
+        if (run) { run.state = "waiting"; run.endedAt = undefined; this.store.saveRun(run); }
+        this.store.put(record); return;
       } else if ((result.state === "human" || result.state === "completed") && this.runner.launchTriage) {
         if (result.state === "completed") this.outcomes.notPublished(record.job);
         await this.queueAssessment(record, result.reason ?? "Run completed; verify any remaining blocker");

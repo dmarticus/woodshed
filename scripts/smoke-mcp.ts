@@ -37,5 +37,14 @@ try {
   await client.readResource({ uri: "woodshed://playbooks" });
   const outcomes = await client.readResource({ uri: "woodshed://outcomes" });
   if (Buffer.byteLength((outcomes.contents[0] as any).text) > 16384) throw Error("Outcome digest exceeds its response bound");
+  const decisions = await client.readResource({ uri: "woodshed://decisions/src/api/reports.py" });
+  const history = JSON.parse((decisions.contents[0] as any).text);
+  if (!history.historical_context_only || !Array.isArray(history.records)) throw Error("Invalid merged decisions resource");
+  if (!live) {
+    const frontend = await client.readResource({ uri: "woodshed://decisions/frontend/src/ReportCard.tsx" });
+    const records = JSON.parse((frontend.contents[0] as any).text).records;
+    if (history.records[0]?.possibly_stale !== true || records[0]?.possibly_stale !== false || JSON.parse((outcomes.contents[0] as any).text).totals.prs_handed_off !== 3)
+      throw Error("Preview must include outcome history and both fresh and stale merged decisions");
+  }
   console.log(JSON.stringify({ passed: true, live, tools, number, phase: data.phase, stale: data.stale, structuredStatus: true, boundedWait: true, resource: true }));
 } finally { await client.close(); controller?.kill(); if (controller) await controller.exited; }

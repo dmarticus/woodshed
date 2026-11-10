@@ -61,6 +61,41 @@ export class GitHub {
       throw error;
     }
   }
+  async changedFiles(number: number, expected?: number): Promise<string[]> {
+    const files: string[] = [];
+    for (let page = 1; page <= 30; page++) {
+      const rows = await this.conditionalJSON(`repos/${this.config.repository}/pulls/${number}/files?per_page=100&page=${page}`);
+      if (!Array.isArray(rows) || rows.some(f => typeof f.filename !== "string")) throw Error("Invalid PR changed-file metadata");
+      files.push(...rows.map(f => f.filename));
+      if (rows.length < 100 || expected !== undefined && files.length === expected) return [...new Set(files)];
+    }
+    throw Error("PR file listing may exceed GitHub's 3,000-file limit; decision promotion requires a complete listing.");
+  }
+  async mergedMetadata(number: number, includeFiles = true): Promise<{ commit: string; mergedAt: string; base: string; author: string; files: string[] }> {
+    const pr = JSON.parse(await this.request(["gh", "api", `repos/${this.config.repository}/pulls/${number}`]));
+    if (!pr.merged || !/^[a-f0-9]{40}$/.test(pr.merge_commit_sha ?? "") || !Number.isFinite(Date.parse(pr.merged_at)) || typeof pr.base?.ref !== "string" || typeof pr.user?.login !== "string") throw Error("Merged PR metadata is not yet available");
+    if (includeFiles && (!Number.isInteger(pr.changed_files) || pr.changed_files > 3000)) throw Error("A complete PR changed-file list is required before decision promotion");
+    const files = includeFiles ? await this.changedFiles(number, pr.changed_files) : [];
+    if (includeFiles && files.length !== pr.changed_files) throw Error("PR file listing is incomplete; decision promotion will retry");
+    return { commit: pr.merge_commit_sha, mergedAt: pr.merged_at, base: pr.base.ref, author: pr.user.login, files };
+  }
+  private decisionTrees = new Map<string, Promise<{ sha: string; tree: { path: string; type: string; sha: string }[] }>>();
+  async decisionTree(ref: string): Promise<{ sha: string; tree: { path: string; type: string; sha: string }[] }> {
+    const immutable = /^[a-f0-9]{40}$/.test(ref);
+    const cached = immutable ? this.decisionTrees.get(ref) : undefined; if (cached) return cached;
+    const request = (async () => {
+      const data = JSON.parse(await this.request(["gh", "api", `repos/${this.config.repository}/git/trees/${encodeURIComponent(ref)}`]));
+      if (data.truncated || !/^[a-f0-9]{40}$/.test(data.sha ?? "") || !Array.isArray(data.tree) || data.tree.some((e: any) => typeof e.path !== "string" || !["tree", "blob", "commit"].includes(e.type) || !/^[a-f0-9]{40}$/.test(e.sha))) throw Error("Incomplete Git tree metadata; freshness remains unknown");
+      return { sha: data.sha, tree: data.tree.map((e: any) => ({ path: e.path, type: e.type, sha: e.sha })) };
+    })();
+    const remember = (key: string, value: typeof request) => {
+      if (!this.decisionTrees.has(key) && this.decisionTrees.size >= 256) this.decisionTrees.delete(this.decisionTrees.keys().next().value!);
+      this.decisionTrees.set(key, value);
+    };
+    if (immutable) remember(ref, request);
+    try { const tree = await request; remember(tree.sha, Promise.resolve(tree)); return tree; }
+    catch (error) { if (immutable) this.decisionTrees.delete(ref); throw error; }
+  }
   async failureEvidence(pr: Snapshot): Promise<CIEvidence> {
     const failures = pr.checks.filter(failed);
     const evidence: CIEvidence = { head: pr.head, reports: [], unavailable: [] };

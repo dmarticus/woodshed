@@ -1,3 +1,4 @@
+import { mergedDecisionContext, type DecisionView } from "./merged-decisions";
 import { GitHub } from "./github";
 import { activeQueuePhase } from "./merge-queue";
 import { mkdirSync, renameSync } from "node:fs";
@@ -19,6 +20,22 @@ import { repairContext, type PublishedResult } from "./playbooks";
 export class Runner {
   models: Models;
   onProgress?: (run: WorkerState) => void;
+  decisionContextFor?: (pr: Snapshot, paths?: string[], job?: Job) => Promise<{ records: DecisionView[]; omitted_records: number }>;
+  private decisionVersion(record: DecisionView): string { return `${record.id}:${record.possibly_stale}`; }
+  private async initialDecisionContext(pr: Snapshot, job: Job, paths?: string[]): Promise<string> {
+    const context = await this.decisionContextFor?.(pr, paths, job);
+    if (!context) return "";
+    job.decisionVersions = context.records.map(r => this.decisionVersion(r));
+    return mergedDecisionContext(context.records, context.omitted_records);
+  }
+  private async newDecisionContext(pr: Snapshot, job: Job, paths: string[], turns: number): Promise<string | undefined> {
+    const context = await this.decisionContextFor?.(pr, paths, job); if (!context) return;
+    const unseen = context.records.filter(r => !job.decisionVersions?.includes(this.decisionVersion(r)));
+    if (!unseen.length) return;
+    job.decisionVersions = [...new Set([...(job.decisionVersions ?? []), ...unseen.map(r => this.decisionVersion(r))])];
+    job.decisionContextAfterTurn = turns; job.contextReview = true;
+    return `The exact proposed file manifest has additional merged-tradeoff evidence that was not supplied before this repair. Review it and reconsider the saved edits before publication. Preserve unrelated work. Return the complete exact file manifest again, including preserved intended edits. Do not publish or expand scope.\n${mergedDecisionContext(unseen, context.omitted_records)}`;
+  }
   constructor(readonly config: Config, readonly dataDir: string, readonly exec: typeof command = command) { this.models = new Models(config); }
   private async guardMergeQueue(current: Snapshot): Promise<void> {
     if (!current.mergeQueue) return;
@@ -90,7 +107,7 @@ If preserving both intentions requires a product decision, credentials, a missin
 Write ${join(resultDirectory, "result.json")} as your last task operation:
 {"outcome":"resolved"|"needs_human","reason":"what you preserved and how you validated it, or the exact decision needed"}.
 The controller verifies file scope, merge ancestry, conflict markers, current PR head, and publishing hooks before publishing. Do not publish anything yourself.`;
-      const directed = prompt + ciEvidenceContext(job.ciEvidence) + handoffContext(job.handoff) + repairContext(job.repairHints) + (job.instructions ? `\nOwner instructions for this attempt:\n${job.instructions}` : "");
+      const directed = prompt + ciEvidenceContext(job.ciEvidence) + handoffContext(job.handoff) + await this.initialDecisionContext(pr, job, [...plan.conflicts, ...plan.ownedFiles]) + repairContext(job.repairHints) + (job.instructions ? `\nOwner instructions for this attempt:\n${job.instructions}` : "");
       await Bun.write(join(directory, "prompt.txt"), directed);
       await this.startAgent(job, checkout, resultDirectory, directed, pr.number);
       return;
@@ -118,7 +135,7 @@ Write your final structured result to ${join(resultDirectory, "result.json")}:
 Use no_change with files:[] when investigation confirms no repository edits are needed. Do not request publication of an empty file list.
 Do not include secrets. Do not stage this result file. A successful exit alone does not mean the PR is ready.
 Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threads: pr.threads, reviews: pr.reviews })}`;
-    const directed = prompt + ciEvidenceContext(job.ciEvidence) + handoffContext(job.handoff) + repairContext(job.repairHints) + (job.instructions ? `\nOwner instructions for this attempt:\n${job.instructions}` : "");
+    const directed = prompt + ciEvidenceContext(job.ciEvidence) + handoffContext(job.handoff) + await this.initialDecisionContext(pr, job) + repairContext(job.repairHints) + (job.instructions ? `\nOwner instructions for this attempt:\n${job.instructions}` : "");
     await Bun.write(join(directory, "prompt.txt"), directed);
     await this.startAgent(job, checkout, resultDirectory, directed, pr.number);
   }
@@ -142,8 +159,14 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     if (run?.costUSD === null || (run?.costUSD ?? 0) >= config.budgetUSD) throw new Error("The original run cannot resume within its budget");
     await this.stop(job);
     try { await this.exec(["hc", "rm", job.name]); } catch (error) { if (!missingSession(error)) throw error; }
+    if (job.decisionContextAfterTurn !== undefined) {
+      // A completed follow-up must provide a fresh publication manifest.
+      for (const result of [join(directory, "agent-result", "result.json"), join(directory, "result.json")])
+        if (await Bun.file(result).exists()) renameSync(result, `${result}.before-decision-review`);
+    }
     config.resumeThreadId = run?.threadId; config.resumeQueued = false; config.recoverRun = !!run;
-    config.prompt = `${await Bun.file(join(directory, "prompt.txt")).text()}\nIndependent GitHub investigation follow-up:\n${instructions}`;
+    const followup = job.contextReview ? "Historical tradeoff review" : "Independent GitHub investigation follow-up";
+    config.prompt = `${await Bun.file(join(directory, "prompt.txt")).text()}\n${followup}:\n${instructions}`;
     await Bun.write(`${path}.tmp`, JSON.stringify(config)); renameSync(`${path}.tmp`, path);
     await this.exec(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", config.checkout, process.execPath, join(import.meta.dir, "worker.ts"), path], { timeout: 90_000 });
   }
@@ -193,7 +216,11 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       }
       if (run.status === "blocked" || run.status === "error") return { state: "human", reason: run.summary };
       if (run.status !== "done") return { state: "working" };
-      const result = await Bun.file(await this.resultPath(job)).json();
+      if (job.decisionContextAfterTurn !== undefined && run.turns <= job.decisionContextAfterTurn) return { state: "working" };
+      job.decisionContextAfterTurn = undefined; job.contextReview = false;
+      const resultFile = Bun.file(await this.resultPath(job));
+      if (!await resultFile.exists()) return { state: "human", reason: "The agent completed without a structured repair result. Inspect the saved work before retrying." };
+      const result = await resultFile.json();
       if (result.outcome === "ready_to_publish" || result.outcome === "no_change") {
         const directory = join(this.dataDir, "jobs", job.name);
         const publisher = new Publisher(join(directory, "checkout"), directory, this.config.repository);
@@ -202,6 +229,10 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
           return { state: "completed", reason: result.reason ?? "No repository changes needed" };
         }
         if (result.outcome === "no_change") return { state: "human", reason: "The run reported no change but its checkout has edits. Verify and declare the intended files before publishing." };
+        if (current?.head === job.head && current.state === "OPEN" && !current.draft && result.outcome === "ready_to_publish" && Array.isArray(result.files) && result.files.every((p: unknown) => typeof p === "string")) {
+          const additional = await this.newDecisionContext(current, job, result.files, run.turns);
+          if (additional) return { state: "decision-context", reason: additional };
+        }
         await this.stop(job);
         if (!current) return { state: "human", reason: "Cannot publish without a current PR snapshot" };
         try {
@@ -243,6 +274,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       const plan = await update.load();
       if (plan.head !== job.head) throw new Error("Saved merge plan does not match this job's original PR head.");
       if (!current) throw new Error("Cannot publish a branch update without a current PR snapshot.");
+      let decisionTurns = 0;
       if (plan.conflicts.length) {
         if (job.adapter === "app-server") {
           const run = await this.runtime(job);
@@ -251,6 +283,9 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
             if (terminal.state === "finished" || Date.now() - Date.parse(job.startedAt) > 60_000) return { state: "human", reason: "The conflict run did not report its startup state. Inspect its terminal before retrying." };
             return { state: "working" };
           }
+          decisionTurns = run.turns;
+          if (job.decisionContextAfterTurn !== undefined && run.turns <= job.decisionContextAfterTurn && run.status === "done") return { state: "working" };
+          if (run.status === "done") { job.decisionContextAfterTurn = undefined; job.contextReview = false; }
           if (run.status === "working") return { state: "working" };
           if (run.status === "blocked" || run.status === "error") return { state: "human", reason: run.summary };
         }
@@ -277,6 +312,10 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
         if (terminal.state === "live") await this.exec(["hc", "kill", job.name]);
       }
       await update.allowAdjacentResolution(plan);
+      if (plan.conflicts.length) {
+        const additional = await this.newDecisionContext(current, job, [...plan.conflicts, ...plan.ownedFiles], decisionTurns);
+        if (additional) return { state: job.adapter === "app-server" ? "decision-context" : "human", reason: additional };
+      }
       await this.guardMergeQueue(current);
       const target = JSON.parse(await this.exec(["gh", "pr", "view", String(plan.number), "--repo", this.config.repository, "--json", "headRefOid,headRefName,baseRefName,state,isDraft"]));
       const verified = { ...current, head: target.headRefOid, branch: target.headRefName, base: target.baseRefName, state: target.state, draft: target.isDraft };

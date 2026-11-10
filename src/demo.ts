@@ -18,7 +18,7 @@ export function seedDemoOutcomes(store: import("./store").Store, config: import(
   try { for (const number of [201, 202, 203]) {
     const head = "a".repeat(40); const received = new Date(clock).toISOString();
     const snapshot: Snapshot = { number, title: "Handle report provider errors", url: `https://github.com/${config.repository}/pull/${number}`, head, branch: `report-${number}`, base: "main", state: "OPEN", draft: false, author: "demo", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", reviews: [{ author: "posthog[bot]", state: "COMMENTED", head, body: "Reviewed", submittedAt: received }], checks: [{ name: "Report tests", status: "COMPLETED", conclusion: "FAILURE", url: "" }], labels: [], threads: [{ id: `demo-thread-${number}`, path: "src/api/reports.py", comments: [{ author: "posthog[bot]", authorType: "Bot", body: "Invented review", url: snapshotURL(number) }] }] };
-    const handoff = { repository: config.repository, number, head, request_id: `demo/author/${number}`, summary: "Handle provider errors", intent: "Preserve delivery preferences", tradeoffs: ["Keep delivery independent from archival"], validation: ["Scoped report tests"], source_session: { kind: "codex" as const, id: `demo-session-${number}` }, id: `demo-${number}`, received_at: received };
+    const handoff = { repository: config.repository, number, head, request_id: `demo/author/${number}`, summary: "Handle provider errors", intent: "Preserve delivery preferences", tradeoffs: number === 202 ? [{ text: "Keep the delivery toggle explicit rather than inferring it from archived state", paths: ["frontend/src/ReportCard.tsx"] }] : ["Keep delivery independent from archival"], validation: ["Scoped report tests"], source_session: { kind: "codex" as const, id: `demo-session-${number}` }, id: `demo-${number}`, received_at: received };
     const record: Record = { snapshot, handoff, paused: false, watching: true, observedAt: received, attempts: 0, fingerprint: "", decision: { kind: "fix", reason: "Report tests failed" } };
     history.enroll(record, true); store.acceptHandoff(record, handoff);
     history.triage(record, { head, route: "repair", category: "review", title: "Handle provider errors", reason: "The provider exception is not handled.", evidence: [], review_threads: [{ id: `demo-thread-${number}`, status: "needs_repair", category: "error_handling", reason: "A provider exception bypasses the user-facing error state.", code_url: `https://github.com/${config.repository}/blob/${head}/src/api/reports.py` }] });
@@ -32,3 +32,21 @@ export function seedDemoOutcomes(store: import("./store").Store, config: import(
   } } finally { store.localHistory = original; }
 }
 function snapshotURL(number: number): string { return `https://github.com/example/project/pull/${number}#discussion`; }
+
+
+export function demoDecisionRepository(): import("./merged-decisions").DecisionRepository {
+  const sha = (n: number) => n.toString(16).repeat(40);
+  const tree = (n: number, entries: [string, string, number][]) => ({ sha: sha(n), tree: entries.map(([path, type, id]) => ({ path, type, sha: sha(id) })) });
+  const trees: {[ref: string]: ReturnType<typeof tree>} = {
+    ["b".repeat(40)]: tree(1, [["src", "tree", 2], ["frontend", "tree", 3]]),
+    [sha(2)]: tree(2, [["api", "tree", 4]]), [sha(4)]: tree(4, [["reports.py", "blob", 5]]),
+    [sha(3)]: tree(3, [["src", "tree", 6]]), [sha(6)]: tree(6, [["ReportCard.tsx", "blob", 7]]),
+    main: tree(8, [["src", "tree", 9], ["frontend", "tree", 3]]),
+    [sha(9)]: tree(9, [["api", "tree", 10]]), [sha(10)]: tree(10, [["reports.py", "blob", 11]]),
+  };
+  return {
+    changedFiles: async () => ["src/api/reports.py", "frontend/src/ReportCard.tsx"],
+    mergedMetadata: async number => ({ commit: "b".repeat(40), mergedAt: new Date(Date.now() - (204 - number) * 86400000).toISOString(), base: "main", author: "demo", files: ["src/api/reports.py", "frontend/src/ReportCard.tsx"] }),
+    decisionTree: async ref => { if (!trees[ref]) throw Error("Unknown invented tree"); return trees[ref]; },
+  };
+}

@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { command } from "./command";
 import type { Store } from "./store";
 
-export async function cleanArtifacts(dataDir: string, store: Store, now = Date.now(), exec = command): Promise<void> {
+export async function cleanArtifacts(dataDir: string, store: Store, now = Date.now(), exec = command, decisions?: { prune(): Promise<number> }): Promise<void> {
+  if (decisions) await decisions.prune();
   const root = join(dataDir, "jobs");
   if (!existsSync(root) || lstatSync(root).isSymbolicLink()) return;
   for (const record of store.all()) {

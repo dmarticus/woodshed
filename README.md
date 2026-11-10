@@ -143,6 +143,12 @@ At the start of an authoring session, read `woodshed://outcomes` (or `woodshed:/
 
 Capture starts when the feature observes a handoff. Older handoffs have partial coverage: missing repair counts, owner-decision history, models, publication results and readiness times remain unknown. A resumed repair can contain multiple rounds in one run; its reported cost is cumulative for that run, not apportioned among rounds. Cancelled and replaced checks do not become CI patterns, and verified controller-only branch/migration repairs are separated from authoring-agent patterns. Review reasons are retained locally, but raw review comments are not copied into outcome history. Paths, text, PR numbers and session references from this history are never added to product analytics. The digest is historical evidence, not a rule set, permission grant or current merge evidence, and is not injected into repair prompts.
 
+Read `woodshed://decisions/src/api/report.py` before editing a file, or query `api/agent/decisions?path=src/api/**/*.py` for a group of files. Woodshed retains tradeoffs from the latest accepted handoff when its PR merges. A string tradeoff applies to every changed file. Use `{"text":"Keep archived reports visible to owners","paths":["src/api/report.py"]}` to name exact repository paths instead. A PR closed without merging contributes no decisions.
+
+Each decision keeps the PR URL, merge commit and date, and the file identities from that merge. Reads return up to 20 decisions, newest first within each freshness group. A changed or removed file makes its decision possibly stale. Unavailable base metadata leaves freshness unknown and cannot trigger deletion. Housekeeping removes a decision only after every applicable path is absent. Missing merge metadata is retried; a read does not create a decision. There are no agent write or delete operations, and decision content stays out of product analytics.
+
+Repair prompts include applicable decisions for known PR, review, CI, or conflict paths. If the final file list surfaces additional context, the repair reviews it before publication under the existing budget and scope. These records are historical evidence and grant no permissions.
+
 Enrolling a PR does not change Watch, Auto, or Paused, and preserves a PR's existing pause and active job. Auto remains responsible for launching maintenance. The server exposes no tool for answering human questions, changing budgets, approving visual diffs, or merging a PR.
 
 ### Scheduling and readiness

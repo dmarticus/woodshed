@@ -27,6 +27,9 @@ export class Store {
     this.db.exec("CREATE TABLE IF NOT EXISTS outcomes (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, time TEXT NOT NULL, kind TEXT NOT NULL, dedupe TEXT NOT NULL UNIQUE, data TEXT NOT NULL)");
     this.db.exec("CREATE INDEX IF NOT EXISTS outcomes_request_kind ON outcomes(request_id,kind,id); CREATE INDEX IF NOT EXISTS outcome_handoffs_scope ON outcome_handoffs(repository,author,received_at)");
     this.db.exec("CREATE TABLE IF NOT EXISTS outcome_runs (run TEXT PRIMARY KEY, request_id TEXT NOT NULL, data TEXT NOT NULL)");
+    this.db.exec("CREATE TABLE IF NOT EXISTS merged_decisions (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, repository TEXT NOT NULL, author TEXT NOT NULL, merged_at TEXT NOT NULL, data TEXT NOT NULL)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS merged_decisions_scope ON merged_decisions(repository,author,merged_at)");
+    this.db.exec("CREATE TABLE IF NOT EXISTS decision_promotions (request_id TEXT PRIMARY KEY, repository TEXT NOT NULL, author TEXT NOT NULL, state TEXT NOT NULL, retry_at TEXT NOT NULL, data TEXT NOT NULL)");
     const noTurnRuns = this.db.query("SELECT data FROM runs WHERE json_extract(data,'$.costUSD') IS NULL AND json_extract(data,'$.turns')=0 AND json_extract(data,'$.endedAt') IS NOT NULL").all() as { data: string }[];
     for (const row of noTurnRuns) {
       const run = JSON.parse(row.data) as Run;

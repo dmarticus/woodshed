@@ -91,11 +91,34 @@ test("status waits ignore polling timestamps, wake for progress, and cancel with
 
 test("agent endpoints require the local credential and the MCP bridge refuses external destinations", async () => {
   const h = harness();
-  for (const path of ["api/agent/inbox", "api/agent/attention", "api/agent/prs/42"]) {
+  for (const path of ["api/agent/inbox", "api/agent/attention", "api/agent/prs/42", "api/agent/decisions?path=src"]) {
     expect((await h.fetch(new Request(`http://127.0.0.1:7341/${path}`, { headers: { Host: "127.0.0.1:7341" } }))).status).toBe(401);
     expect((await h.fetch(new Request(`http://127.0.0.1:7341/${path}`, { headers: { Host: "127.0.0.1:7341", Authorization: `Bearer ${h.token}`, Origin: "http://127.0.0.1:7341" } }))).status).toBe(401);
   }
   for (const url of ["https://example.com", "http://127.0.0.1:7341@evil.example", "http://127.0.0.1:7341/?token=value"]) expect(() => new ControllerClient(url)).toThrow();
+});
+
+test("merged decisions are readable by file or glob through MCP and have no write route", async () => {
+  const h = harness(); const github = h.controller.github;
+  github.viewerName = "fixture"; await h.controller.handoff(h.handoff);
+  const merge = "c".repeat(40), root = "d".repeat(40), sub = "e".repeat(40), blob = "f".repeat(40);
+  github.mergedMetadata = async () => ({ commit: merge, mergedAt: new Date().toISOString(), base: "main", author: "fixture", files: ["src/report.ts"] });
+  github.decisionTree = async ref => ref === sub
+    ? { sha: sub, tree: [{ path: "report.ts", type: "blob", sha: blob }] }
+    : { sha: root, tree: [{ path: "src", type: "tree", sha: sub }] };
+  const record = h.store.get(42)!; record.snapshot.state = "MERGED"; h.store.put(record);
+  await h.controller.decisions.processPending();
+  const server = createMcpServer(h.client); const client = new Client({ name: "fixture", version: "1" });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b); close.push(async () => { await client.close(); await server.close(); });
+  expect((await client.listResourceTemplates()).resourceTemplates.some(r => r.uriTemplate === "woodshed://decisions/{path}" && r.description?.includes("Historical evidence"))).toBe(true);
+  for (const path of ["src/report.ts", "src%2Freport.ts", "src%2F%2A%2A%2F%2A.ts"]) {
+    const result = await client.readResource({ uri: `woodshed://decisions/${path}` });
+    expect(JSON.parse((result.contents[0] as any).text)).toMatchObject({ historical_context_only: true, records: [{ text: h.handoff.tradeoffs[0], merge_commit: merge, possibly_stale: false, paths: [{ path: "src/report.ts", blob_sha: blob }] }] });
+  }
+  expect((await h.fetch(new Request("http://127.0.0.1:7341/api/agent/decisions?path=src", { method: "POST", headers: { Host: "127.0.0.1:7341", Authorization: `Bearer ${h.token}` } }))).status).toBe(404);
+  await expect(h.client.request("api/agent/decisions?path=../outside")).rejects.toThrow("repository-relative");
+  github.viewerName = "different-user";
+  expect(await h.client.request("api/agent/decisions?path=src")).toMatchObject({ records: [] });
 });
 
 

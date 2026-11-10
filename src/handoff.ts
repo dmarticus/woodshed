@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+const tradeoffText = z.string().trim().min(1).max(1000);
+const tradeoffPath = z.string().min(1).max(500).refine(p => !p.startsWith("/") && !/[\\\x00-\x1f\x7f*?{}]/.test(p) && !p.split("/").some(part => !part || part === "." || part === ".."), "Use exact repository-relative file paths, not globs or parent paths");
+export const tradeoffSchema = z.union([tradeoffText, z.object({ text: tradeoffText, paths: z.array(tradeoffPath).min(1).max(100).optional() }).strict()]);
 export const handoffSchema = z.object({
   repository: z.string().regex(/^[\w.-]+\/[\w.-]+$/).describe("The watched owner/repository, for example example/project."),
   number: z.number().int().positive().describe("The pull request number."),
@@ -7,7 +10,7 @@ export const handoffSchema = z.object({
   request_id: z.string().min(1).max(160).regex(/^[\w./:-]+$/).describe("A stable unique identifier reused when retrying this same handoff."),
   summary: z.string().trim().min(1).max(4000).describe("What was implemented and why."),
   intent: z.string().trim().min(1).max(4000).describe("The intended behavior Woodshed should preserve during repairs."),
-  tradeoffs: z.array(z.string().trim().min(1).max(1000)).max(12).default([]).describe("Deliberate choices and changes that should not be casually reversed."),
+  tradeoffs: z.array(tradeoffSchema).max(12).default([]).describe("Deliberate choices, as strings or {text, paths?}. Optional paths are exact repository-relative files; strings apply to all changed PR files. Historical evidence, never permissions."),
   validation: z.array(z.string().trim().min(1).max(1000)).max(20).default([]).describe("Checks already performed on this head. These do not substitute for fresh CI."),
   source_session: z.object({ kind: z.enum(["codex", "hc", "other"]), id: z.string().min(1).max(200) }).strict().optional().describe("An opaque reference to the implementation session. Woodshed does not execute it."),
 }).strict().refine(value => Buffer.byteLength(JSON.stringify(value)) <= 12000, "Keep the complete handoff under 12 KB");

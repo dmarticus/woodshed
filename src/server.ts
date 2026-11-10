@@ -1,6 +1,6 @@
 import { resolve, isAbsolute } from "node:path";
 import { Controller } from "./controller";
-import { demoRecords, seedDemoOutcomes } from "./demo";
+import { demoRecords, seedDemoOutcomes, demoDecisionRepository } from "./demo";
 import { GitHub } from "./github";
 import { Runner } from "./runner";
 import { Store } from "./store";
@@ -40,8 +40,8 @@ if (config.automation && (!isAbsolute(config.checkout) || !await Bun.file(resolv
 const store = new Store(demo ? ":memory:" : resolve(root, ".woodshed", "state.sqlite"));
 if (demo) demoRecords().forEach(r => store.put(r));
 const analytics = new Analytics(resolve(root, ".woodshed"), { enabled: !demo });
-const controller = new Controller(config, store, new GitHub(config), new Runner(config, resolve(root, ".woodshed")), Date.now, analytics);
-if (demo) { controller.github.viewerName = "demo"; seedDemoOutcomes(store, config); }
+const controller = new Controller(config, store, new GitHub(config), new Runner(config, resolve(root, ".woodshed")), Date.now, analytics, undefined, demo ? demoDecisionRepository() : undefined);
+if (demo) { controller.github.viewerName = "demo"; seedDemoOutcomes(store, config); await controller.decisions.processPending(); }
 const settings = new Settings(config, configPath, demo);
 if (!demo) await controller.prepareAttention();
 if (!demo) analytics.capture("woodshed_started", { mode: config.mode, component: "controller", remote: process.env.WOODSHED_REMOTE === "1" });
@@ -66,10 +66,11 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
   void (async () => { server.stop(); power.close(); await Promise.race([analytics.flush(), Bun.sleep(1500)]); analytics.close(); process.exit(0); })();
 });
 if (!demo) {
-  void cleanArtifacts(resolve(root, ".woodshed"), store).catch(error => store.log(null, `Housekeeping: ${error.message}`));
-  setInterval(() => { void cleanArtifacts(resolve(root, ".woodshed"), store).catch(error => store.log(null, `Housekeeping: ${error.message}`)); }, 6 * 3600000);
+  void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`));
+  setInterval(() => { void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`)); }, 6 * 3600000);
   void controller.runner.models.list().catch(error => console.error(`Model catalog: ${error.message}`));
   void controller.sync();
+  setInterval(() => { void controller.decisions.processPending().catch(error => store.log(null, `Decision promotion deferred: ${error.message}`)); }, 30_000);
   setInterval(() => { void controller.refreshMergeQueues(); }, 30_000);
   setInterval(() => { void controller.refreshAttention().catch(error => { controller.error = error.message; }); }, 30_000);
   setInterval(() => { void controller.fillWorkers(); }, 2_000);

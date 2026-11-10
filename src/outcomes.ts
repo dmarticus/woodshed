@@ -71,7 +71,7 @@ export class Outcomes {
     const roundKey = `${id}:repair_round:${job.name}:${round}`;
     const previousRound = this.store.db.query("SELECT data FROM outcomes WHERE dedupe=?").get(roundKey) as any;
     const checks = currentChecks(record.snapshot.checks).filter(c => failed(c) && c.conclusion !== "CANCELLED" && !queueCheck(c)).map(c => ({ name: c.name.slice(0, 500), status: c.status, conclusion: c.conclusion, url: c.url, source: c.source, startedAt: c.startedAt }));
-    const data = previousRound ? JSON.parse(previousRound.data) : { run: job.name, head: job.head, kind: job.kind ?? null, checks };
+    const data = previousRound ? JSON.parse(previousRound.data) : { run: job.name, head: job.head, kind: job.kind ?? null, origin: job.contextReview ? "decision_context" : "repair", checks };
     this.store.db.query("INSERT OR IGNORE INTO outcome_runs VALUES(?,?,?)").run(job.name, id, JSON.stringify(data));
     this.append(id, "repair_round", `${job.name}:${round}`, data);
     const evidence = job.ciEvidence ?? record.assessment?.ciEvidence;
@@ -138,7 +138,7 @@ export class Outcomes {
       if (row.kind === "review_finding") findings.set(`${h.request_id}:${d.thread}:${d.head}`, { ...d, number: h.number });
       if (row.kind === "ci_failure") ci.set(d.identity, { ...d, number: h.number });
       if (row.kind === "ci_superseded") supersededCI.add(d.identity);
-      if (d.run) { const r = runs.get(d.run) ?? { run: d.run, number: h.number, request_id: h.request_id, rounds: 0, model: null, turns: null, estimated_cost_usd: null, published: null, controller: [] }; if (row.kind === "repair_round") r.rounds++; if (row.kind === "repair_run") Object.assign(r, d); if (row.kind === "publication") r.published = d.published; if (row.kind === "controller_repair" && !r.controller.includes(d.category)) r.controller.push(d.category); runs.set(d.run, r); }
+      if (d.run) { const r = runs.get(d.run) ?? { run: d.run, number: h.number, request_id: h.request_id, rounds: 0, model: null, turns: null, estimated_cost_usd: null, published: null, controller: [] }; if (row.kind === "repair_round" && d.origin !== "decision_context") r.rounds++; if (row.kind === "repair_run") Object.assign(r, d); if (row.kind === "publication") r.published = d.published; if (row.kind === "controller_repair" && !r.controller.includes(d.category)) r.controller.push(d.category); runs.set(d.run, r); }
     }
     const controllerOnly = (run: any): boolean => !!run?.controller.some((c: string) => deterministic.has(c)) && !(run.turns > 0);
     for (const run of runs.values()) { if (!controllerOnly(run) && run.turns > 0) perPR.get(run.number)!.rounds += run.rounds; recent.get(run.request_id)?.repairs.push({ run: run.run, rounds: run.turns === null ? null : run.turns > 0 ? run.rounds : 0, model: run.model, published: run.published, estimated_cost_usd: run.estimated_cost_usd, controller_categories: run.controller }); }
