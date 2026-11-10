@@ -599,6 +599,11 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         if record.isReadyForQueue { return "merge-queue-ready:" + (record.mergeQueueSubmission?.heads.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",") ?? record.snapshot.head) }
         return "\(record.snapshot.head):\(record.decision.kind):\(record.decision.id ?? record.decision.reason)"
     }
+    func notificationCategory(_ record: PullRequestRecord) -> String {
+        if record.mergeQueue?.needsAttention == true { return "attention" }
+        let run = lastRun(record)
+        return record.isReadyForQueue || record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : (record.decision.response == "reply" || record.decision.response == nil && record.decision.question != nil || run?.prompt?.kind == "question") ? "question" : "attention"
+    }
     private func updateNotifications() async {
         guard !updatingNotifications else { return }
         updatingNotifications = true; defer { updatingNotifications = false }
@@ -619,7 +624,6 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         // Retain delivered versions even when a PR leaves attention. A brief
         // disappearance must not turn the same question into a new notification.
         for record in records {
-            let run = lastRun(record)
             let version = notificationVersion(record)
             let key = String(record.id)
             guard seen[key] != version else { continue }
@@ -634,7 +638,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
                 }
                 continue
             }
-            let category = record.isReadyForQueue || record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : (record.decision.response == "reply" || record.decision.response == nil && record.decision.question != nil || run?.prompt?.kind == "question") ? "question" : "attention"
+            let category = notificationCategory(record)
             let delivered = await deliver(record, title: record.isReadyForQueue ? "Ready for merge queue" : record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.isReadyForQueue ? "Review the included PRs in Woodshed, then submit them to Trunk when you are ready." : record.decision.question ?? record.decision.reason, category: category, identifier: "pr-\(key)")
             let current = ((notifyNeeds ? attention : []) + (notifyReady ? ready : [])).first { $0.id == record.id }
             let currentVersion = current.map { notificationVersion($0) }

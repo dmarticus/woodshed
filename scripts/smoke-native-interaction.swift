@@ -252,7 +252,12 @@ struct InteractionSmoke {
         queue["terminal"] = ["id": "attempt-1", "reason": "Tests failed", "acknowledged": false]
         record["mergeQueue"] = queue; record["decision"] = ["kind": "human", "reason": "Queue tests failed", "id": "old-decision"]
         records[0] = record; data["prs"] = records; model.state = try decoded()
+        var oldBudget = (data["runs"] as! [[String: Any]])[0]
+        oldBudget["number"] = number; oldBudget["state"] = "budget"
+        data["runs"] = [oldBudget]; model.state = try decoded()
         let first = model.state!.prs[0]
+        precondition(model.lastRun(first)?.state == "budget")
+        precondition(model.notificationCategory(first) == "attention")
         precondition(model.section(for: first) == .attention)
         snapshot["head"] = "changed-head"; record["snapshot"] = snapshot
         record["decision"] = ["kind": "human", "reason": "Queue tests failed", "id": "new-decision"]
