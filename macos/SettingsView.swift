@@ -60,9 +60,23 @@ struct SettingsView: View {
                     Text("Codex default").tag("")
                     ForEach(model.state?.models ?? []) { Text($0.name).tag($0.id) }
                 }.disabled(!model.canSaveSettings)
-                LabeledContent("Concurrent runs") {
-                    HStack { Text(String(model.state?.settings?.maxConcurrentJobs ?? 1)).monospacedDigit(); Stepper("", value: integerBinding("maxConcurrentJobs", model.state?.settings?.maxConcurrentJobs ?? 1), in: 1...8).labelsHidden().fixedSize() }
+                Picker("Concurrent agents", selection: textBinding("concurrencyMode", model.state?.settings?.concurrencyMode ?? "fixed")) {
+                    Text("Automatic").tag("adaptive")
+                    Text("Fixed limit").tag("fixed")
                 }.disabled(!model.canSaveSettings)
+                if model.state?.settings?.concurrencyMode == "adaptive" {
+                    LabeledContent("CPU target") {
+                        HStack { Text("\(model.state?.settings?.cpuTargetPercent ?? 80)%").monospacedDigit(); Stepper("", value: integerBinding("cpuTargetPercent", model.state?.settings?.cpuTargetPercent ?? 80), in: 20...95, step: 5).labelsHidden().fixedSize() }
+                    }.disabled(!model.canSaveSettings)
+                    LabeledContent("Memory target") {
+                        HStack { Text("\(model.state?.settings?.memoryTargetPercent ?? 80)%").monospacedDigit(); Stepper("", value: integerBinding("memoryTargetPercent", model.state?.settings?.memoryTargetPercent ?? 80), in: 50...90, step: 5).labelsHidden().fixedSize() }
+                    }.disabled(!model.canSaveSettings)
+                    Text("Starts agents one at a time while the server has headroom. Busy agents continue; new starts wait when usage reaches a target.").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    LabeledContent("Maximum agents") {
+                        HStack { Text(String(model.state?.settings?.maxConcurrentJobs ?? 1)).monospacedDigit(); Stepper("", value: integerBinding("maxConcurrentJobs", model.state?.settings?.maxConcurrentJobs ?? 1), in: 1...128).labelsHidden().fixedSize() }
+                    }.disabled(!model.canSaveSettings)
+                }
                 LabeledContent("Attempts before asking you") {
                     HStack { Text(String(model.state?.settings?.maxAttempts ?? 3)).monospacedDigit(); Stepper("", value: integerBinding("maxAttempts", model.state?.settings?.maxAttempts ?? 3), in: 1...10).labelsHidden().fixedSize() }
                 }.disabled(!model.canSaveSettings)

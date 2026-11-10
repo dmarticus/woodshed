@@ -31,6 +31,9 @@ struct ControllerSettings: Decodable, Sendable {
     var paused: Bool
     var pollSeconds: Int
     var maxAttempts: Int
+    var concurrencyMode: String?
+    var cpuTargetPercent: Int?
+    var memoryTargetPercent: Int?
     var maxConcurrentJobs: Int
     var defaultModel: String?
     var retryModel: String?
@@ -50,6 +53,12 @@ struct Spend: Decodable, Sendable {
     let prTotals: [String: Double?]
 }
 struct ControllerHealth: Decodable, Sendable {
+    struct Scheduler: Decodable, Sendable {
+        let mode: String?
+        let cpuPercent: Double?
+        let memoryPercent: Double?
+    }
+    let scheduler: Scheduler?
     let lastPoll: String?
     let lastContact: String?
     let queueDepth: Int

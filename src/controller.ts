@@ -14,11 +14,17 @@ import { SharedCI } from "./ci-incidents";
 import { Playbooks } from "./playbooks";
 import type { Analytics } from "./analytics";
 import { ProductAnalytics, type ActionSource } from "./product-analytics";
-import { workerCapacity, dollarsDown, MIN_RUN_BUDGET, type WorkerCapacity } from "./capacity";
+import { workerCapacity, dollarsDown, MIN_RUN_BUDGET, ADMISSION_INTERVAL_MS, type CapacityPolicy, type WorkerCapacity } from "./capacity";
+import { ownerAttention, attentionStillNeeded } from "./owner-attention";
 import { buildInfo } from "./build-info";
 
 export class Controller {
   syncing = false;
+  private dispatching = false;
+  private lastAdmissionAt = -Infinity;
+  private admitted(): void { this.lastAdmissionAt = this.now(); }
+  private capacity(): WorkerCapacity { return this.resources(this.config.maxConcurrentJobs, { ...this.config, active: this.activeSlots() }); }
+  private settling(): boolean { return this.config.concurrencyMode === "adaptive" && this.now() - this.lastAdmissionAt < ADMISSION_INTERVAL_MS; }
   acting = false;
   lastSync: string | null = null;
   error: string | null = null;
@@ -29,7 +35,7 @@ export class Controller {
   sleeping = false;
   health() {
     const records = this.store.all();
-    return { build: buildInfo, scheduler: { ...this.resources(this.config.maxConcurrentJobs), configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
+    return { build: buildInfo, scheduler: { ...this.capacity(), mode: this.config.concurrencyMode ?? "fixed", cpuTargetPercent: this.config.cpuTargetPercent ?? 80, memoryTargetPercent: this.config.memoryTargetPercent ?? 80, configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
   }
   power(event: "sleep" | "wake", confirmed = true): void {
     if (process.env.WOODSHED_REMOTE === "1" && confirmed) return;
@@ -71,7 +77,7 @@ export class Controller {
   readonly incidents: SharedCI;
   readonly playbooks: Playbooks;
   readonly telemetry?: ProductAnalytics;
-  constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number) => WorkerCapacity = workerCapacity) {
+  constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number, policy?: CapacityPolicy) => WorkerCapacity = workerCapacity) {
     this.incidents = new SharedCI(github, store, now); this.playbooks = new Playbooks(store); runner.onProgress = run => store.saveRun(run);
     if (analytics) this.telemetry = new ProductAnalytics(analytics, store, config, now);
   }
@@ -106,7 +112,7 @@ export class Controller {
     } finally { this.refreshingAttention = false; }
   }
   async sync(): Promise<void> {
-    if (this.syncing || this.acting || this.budgetChecking || this.sleeping) return;
+    if (this.syncing || this.dispatching || this.acting || this.budgetChecking || this.sleeping) return;
     this.syncing = true;
     try {
       const attention = this.store.all().filter(r => r.decision.kind === "human").map(r => r.snapshot.number);
@@ -125,6 +131,26 @@ export class Controller {
       this.lastSync = new Date().toISOString();
     } catch (error) { this.error = error instanceof Error ? error.message : String(error); }
     finally { this.syncing = false; }
+  }
+  async fillWorkers(): Promise<void> {
+    if (this.dispatching || this.acting || this.budgetChecking || this.sleeping || modeOf(this.config) === "paused" || this.settling()) return;
+    if (this.activeSlots() >= this.parallelLimit()) return;
+    const records = this.store.all();
+    const canFundStart = this.budgetAvailable() >= MIN_RUN_BUDGET;
+    const eligible = records.filter(r => !this.locks.has(r.snapshot.number) && !r.paused && r.watching !== false && r.snapshot.state === "OPEN" && !r.snapshot.draft && !r.assessment?.attention && r.decision.kind !== "human" &&
+      (modeOf(this.config) === "auto" || r.runRequested || r.assessment?.allowWatch || r.pendingReply || r.resumeRequested) &&
+      (!r.recovery?.retryAt || Date.parse(r.recovery.retryAt) <= this.now()) && !stackBlock(r.snapshot, records, false) &&
+      (r.pendingReply || r.resumeRequested || canFundStart && !r.job && (r.decision.kind === "fix" || r.assessment && (!r.assessment.result || r.assessment.result.route === "repair" && r.assessment.followups < 2))));
+    if (!eligible.length) return;
+    this.dispatching = true;
+    let work: Promise<void>;
+    try {
+      const number = stackOrder(eligible.map(r => r.snapshot.number), records)[0]!;
+      work = this.withPR(number, async () => { await this.reconcile(await this.github.snapshot(number)); });
+    } finally { this.dispatching = false; }
+    // Preparation can fetch a large checkout. Its PR lock and persisted budget
+    // reservation remain held, while later ticks can admit other independent PRs.
+    try { await work; } catch (error) { this.error = String(error); }
   }
   private async refreshHuman(record: Record): Promise<void> {
     if (record.humanHead === undefined) return;
@@ -156,6 +182,14 @@ export class Controller {
     const previousKind = prior?.decision.kind;
     const previousHead = prior?.snapshot.head;
     const record: Record = prior ?? { snapshot, decision: { kind: "waiting", reason: "Checking PR" }, paused: false, attempts: 0, fingerprint: "" };
+    // Upgrade already-visible verified escalations using their previous snapshot
+    // before replacing it with fresh GitHub data. Raw worker reports aren't latched.
+    const assessment = record.assessment;
+    const verified = assessment?.result;
+    if (assessment && !assessment.attention && verified && record.decision.kind === "human" &&
+      (verified.route === "ask" && record.decision.title === verified.title || verified.route === "repair" && assessment.followups >= 2 && record.decision.response === "retry")) {
+      assessment.attention = ownerAttention(record.snapshot, verified, record.decision);
+    }
     record.snapshot = snapshot;
     record.observedAt = new Date(this.now()).toISOString();
     this.playbooks.confirm(snapshot);
@@ -166,7 +200,7 @@ export class Controller {
     if (record.recovery?.head !== snapshot.head) record.recovery = undefined;
     if (await this.recover(record, observeOnly)) { this.store.put(record); return; }
     if (record.assessment?.result?.category === "operations" && record.assessment.head !== snapshot.head && snapshot.state === "OPEN") {
-      record.assessment = { ...record.assessment, head: snapshot.head, key: "", result: undefined, attempts: 0, jevChecked: false };
+      record.assessment = { ...record.assessment, head: snapshot.head, key: "", result: undefined, attention: undefined, attempts: 0, jevChecked: false };
     }
     if (record.assessment && (record.assessment.head !== snapshot.head || snapshot.state !== "OPEN" || snapshot.draft || record.watching === false)) record.assessment = undefined;
     if (!record.assessment) await this.refreshHuman(record);
@@ -185,7 +219,7 @@ export class Controller {
       if (run) { this.store.saveRun(run); if (record.sleepInterruptedAt && run.updatedAt && Date.parse(run.updatedAt) > Date.parse(this.resumedAt ?? record.sleepInterruptedAt)) record.sleepInterruptedAt = undefined; }
     }
     if (!observeOnly && record.resumeRequested && record.job && this.activeSlots(snapshot.number) < this.parallelLimit() && modeOf(this.config) !== "paused") {
-      try { await this.runner.resume(record.job, record.resumeRequested); }
+      try { this.admitted(); await this.runner.resume(record.job, record.resumeRequested); }
       catch (error) {
         const instructions = record.resumeRequested;
         this.scheduleRecovery(record, "resume", String(error)); record.recovery!.instructions = instructions;
@@ -196,7 +230,7 @@ export class Controller {
       if (resumed) { resumed.state = "running"; resumed.endedAt = undefined; resumed.prompt = undefined; this.store.saveRun(resumed); }
     }
     if (!observeOnly && record.pendingReply && record.job && this.activeSlots(snapshot.number) < this.parallelLimit() && modeOf(this.config) !== "paused") {
-      record.job.afterTurn = await this.runner.send(record.job, record.pendingReply, record.pendingPromptId);
+      this.admitted(); record.job.afterTurn = await this.runner.send(record.job, record.pendingReply, record.pendingPromptId);
       record.job.startedAt = new Date().toISOString();
       record.pendingReply = undefined; record.pendingPromptId = undefined;
       record.humanHead = undefined; record.humanReason = undefined; record.humanObservation = undefined;
@@ -268,7 +302,7 @@ export class Controller {
       if (record.pendingAnswer && record.decision.kind === "human") {
         const candidate = record.pendingAnswer;
         if (sameQuestion(record.decision, candidate.questionKey) && record.assessment?.result?.route === "ask") {
-          record.assessment.reply = candidate.text; record.assessment.result = undefined; record.assessment.attempts = 0;
+          record.assessment.reply = candidate.text; record.assessment.attention = undefined; record.assessment.result = undefined; record.assessment.attempts = 0;
           record.pendingAnswer = undefined; record.decision = { kind: "waiting", reason: "Your answer still applies; checking the updated PR" };
         } else candidate.requiresConfirmation = true;
       }
@@ -317,7 +351,7 @@ export class Controller {
         record.instructions = undefined;
         record.attempts++;
         this.store.put(record);
-        this.store.saveRun(this.initialRun(record.job, snapshot.number));
+        this.admitted(); this.store.saveRun(this.initialRun(record.job, snapshot.number));
         try {
           if (record.job.kind === "repair" && this.github.failureEvidence) { record.job.ciEvidence = await this.github.failureEvidence(snapshot); this.store.put(record); }
           await this.runner.launch(snapshot, record.job);
@@ -429,7 +463,7 @@ export class Controller {
       record.decision = { kind: "human", title: "Review the run budget", reason: "The interrupted run cannot resume within its spend limit. Review Spend settings before continuing." }; record.budgetDay = localDay(); return true;
     }
     try {
-      await this.runner.resume(job, recovery.instructions ?? "The local worker was interrupted. Recheck GitHub and continue the original task in this checkout. Preserve all existing edits and do not repeat publication already confirmed on GitHub.");
+      this.admitted(); await this.runner.resume(job, recovery.instructions ?? "The local worker was interrupted. Recheck GitHub and continue the original task in this checkout. Preserve all existing edits and do not repeat publication already confirmed on GitHub.");
       recovery.retryAt = undefined;
       if (run) { run.state = "running"; run.endedAt = undefined; run.prompt = undefined; this.store.saveRun(run); }
       record.decision = { kind: "waiting", reason: "Resumed the interrupted run in its saved checkout" };
@@ -487,6 +521,10 @@ export class Controller {
       record.decision = decide(pr, record);
       return false;
     }
+    if (assessment.attention) {
+      if (attentionStillNeeded(assessment.attention, pr)) { record.decision = assessment.attention.decision; return true; }
+      assessment.attention = undefined; assessment.result = undefined; assessment.attempts = 0;
+    }
     const key = assessmentKey(pr);
     if (assessment.key !== key) { assessment.key = key; assessment.result = undefined; assessment.attempts = 0; assessment.ciEvidence = undefined; }
     // Older investigations hid failed CI behind a reviewer wait. Refresh that
@@ -516,6 +554,7 @@ export class Controller {
     if (result) {
       if (result.route === "ask") {
         record.decision = { kind: "human", title: result.title, reason: result.reason, question: result.question, response: result.response ?? "reply", options: result.options, action: result.action };
+        assessment.attention = ownerAttention(pr, result, record.decision);
         return true;
       }
       if (result.route === "wait") {
@@ -541,7 +580,7 @@ export class Controller {
         if (!observeOnly && modeOf(this.config) === "auto" && this.activeSlots(pr.number) < this.parallelLimit() && prepared?.kind === "branch-update" && /Resolution (?:edited files outside the conflict set|changed the automatic merge outside its conflicts)/.test(assessment.report) && this.runner.recoverPreparedUpdate) {
           try {
             if (await this.runner.recoverPreparedUpdate(prepared, pr)) {
-              record.job = prepared; assessment.result = undefined; record.humanHead = undefined; record.humanReason = undefined; record.humanObservation = undefined; record.recovery = undefined;
+              this.admitted(); record.job = prepared; assessment.result = undefined; record.humanHead = undefined; record.humanReason = undefined; record.humanObservation = undefined; record.recovery = undefined;
               record.decision = { kind: "waiting", reason: "Validating the saved conflict resolution and its related PR edits" };
               this.store.log(pr.number, "Recovered the completed conflict resolution after validating its additional PR-owned files");
               return true;
@@ -550,6 +589,7 @@ export class Controller {
         }
         if (assessment.followups >= 2) {
           record.decision = remainingRepairDecision(pr, result);
+          assessment.attention = ownerAttention(pr, result, record.decision);
           return true;
         }
         record.decision = { kind: "waiting", reason: "Agent follow-up queued" };
@@ -563,7 +603,7 @@ export class Controller {
             const previousBudget = source.budgetUSD;
             try {
               source.budgetUSD = (run?.costUSD ?? 0) + allowance;
-              await this.runner.resume(source, result.instructions!);
+              this.admitted(); await this.runner.resume(source, result.instructions!);
               record.job = source; record.humanHead = undefined;
               if (run) { run.budgetUSD = source.budgetUSD; run.state = "running"; run.endedAt = undefined; run.prompt = undefined; this.store.saveRun(run); }
               assessment.followups++; assessment.result = undefined;
@@ -586,7 +626,8 @@ export class Controller {
     }
     record.decision = { kind: "waiting", reason: "Checking the result against GitHub" };
     if (assessment.attempts >= 2) {
-      record.decision = { kind: "human", title: "Recheck this PR", reason: "Woodshed could not verify the escalation against GitHub after two attempts.", question: "Choose Recheck GitHub to try again, or open the PR to inspect it.", action: { label: "Open pull request", url: pr.url } };
+      record.decision = { kind: "human", response: "recheck", title: "Recheck this PR", reason: "Woodshed could not verify the escalation against GitHub after two attempts.", question: "Choose Recheck GitHub to try again, or open the PR to inspect it.", action: { label: "Open pull request", url: pr.url } };
+      assessment.attention = ownerAttention(pr, { head: pr.head, route: "ask", category: "internal", title: record.decision.title!, reason: record.decision.reason, evidence: [] }, record.decision);
       return true;
     }
     if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.parallelLimit()) return true;
@@ -601,7 +642,7 @@ export class Controller {
       return true;
     }
     const job: Job = { name: `ws-triage-${pr.number}-${randomUUID().slice(0, 8)}`, head: pr.head, fingerprint: record.fingerprint, startedAt: new Date().toISOString(), kind: "triage", model: this.config.defaultModel, budgetUSD: budget, adapter: "app-server" };
-    record.job = job; assessment.attempts++;
+    this.admitted(); record.job = job; assessment.attempts++;
     this.store.put(record); this.store.saveRun(this.initialRun(job, pr.number));
     try {
       job.ciEvidence = assessment.ciEvidence?.head === pr.head ? assessment.ciEvidence : await this.github.failureEvidence?.(pr);
@@ -704,7 +745,7 @@ export class Controller {
       if (action === "reply" && input.message?.trim()) {
         record.pendingAnswer = { text: input.message.trim().slice(0, 8000), questionKey: input.questionKey, requiresConfirmation: !sameQuestion(record.decision, input.questionKey) };
         if (sameQuestion(record.decision, input.questionKey) && record.assessment?.result?.route === "ask") {
-          record.assessment.reply = record.pendingAnswer.text; record.assessment.result = undefined; record.assessment.attempts = 0;
+          record.assessment.reply = record.pendingAnswer.text; record.assessment.attention = undefined; record.assessment.result = undefined; record.assessment.attempts = 0;
           record.pendingAnswer = undefined; record.decision = { kind: "waiting", reason: "Your answer still applies; checking the updated PR" };
         }
         this.store.put(record); return;
@@ -756,7 +797,7 @@ export class Controller {
       if (record.assessment) {
         record.assessment.reply = input.message?.trim();
         if (action === "reply") record.assessment.allowWatch = true;
-        record.assessment.result = undefined; record.assessment.attempts = 0;
+        record.assessment.attention = undefined; record.assessment.result = undefined; record.assessment.attempts = 0;
         record.assessment.key = "";
       }
       record.humanHead = undefined; record.humanReason = undefined;
@@ -831,25 +872,26 @@ export class Controller {
     finally { this.acting = false; if (this.telemetry) this.telemetry.actionContext = undefined; }
   }
   parallelLimit(): number {
-    const capacity = this.resources(this.config.maxConcurrentJobs);
-    return capacity.blocked ? 0 : capacity.limit;
+    const capacity = this.capacity();
+    return capacity.blocked || this.settling() ? 0 : capacity.limit;
   }
   launchBudget(limit: number, number?: number): number {
     const records = this.store.all();
     const runnable = records.filter(r => !r.job && !r.paused && r.watching !== false && r.skippedHead !== r.snapshot.head && r.snapshot.state === "OPEN" && !r.snapshot.draft && !stackBlock(r.snapshot, records, false) && (r.decision.kind === "fix" || r.decision.kind !== "human" && r.assessment && (!r.assessment.result || r.assessment.result.route === "repair")));
     const waiting = runnable.length + (number !== undefined && !runnable.some(r => r.snapshot.number === number) ? 1 : 0);
     const available = this.budgetAvailable();
-    const contenders = Math.max(1, Math.min(this.parallelLimit() - this.activeSlots(), waiting, Math.floor((available + 1e-9) / MIN_RUN_BUDGET)));
+    const contenders = Math.max(1, Math.min(this.capacity().limit - this.activeSlots(), waiting, Math.floor((available + 1e-9) / MIN_RUN_BUDGET)));
     return dollarsDown(Math.min(limit, available / contenders));
   }
   queueStatus(record: Record): { reason: string; message: string } | undefined {
     if (record.job || record.paused || record.watching === false || record.snapshot.draft || record.snapshot.state !== "OPEN" || ["human", "ready", "closed"].includes(record.decision.kind) || record.stackWait) return undefined;
-    if (record.decision.kind !== "fix" && !(record.assessment && !record.assessment.result)) return undefined;
+    if (record.decision.kind !== "fix" && !(record.assessment && (!record.assessment.result || record.assessment.result.route === "repair" && record.assessment.followups < 2))) return undefined;
     if (modeOf(this.config) === "paused") return { reason: "paused", message: "Waiting for automation to resume" };
     if (modeOf(this.config) !== "auto" && !record.runRequested && !record.assessment?.allowWatch) return undefined;
-    const capacity = this.resources(this.config.maxConcurrentJobs);
+    const capacity = this.capacity();
     if (capacity.blocked === "memory") return { reason: "memory", message: "Waiting for memory to free up on the server" };
     if (capacity.blocked === "cpu") return { reason: "cpu", message: "Waiting for CPU capacity on the server" };
+    if (this.settling()) return { reason: "settling", message: "Checking server headroom before starting the next agent" };
     const active = this.activeSlots();
     if (active >= capacity.limit) return { reason: "capacity", message: `Waiting for a worker · ${active} of ${capacity.limit} running` };
     if (this.budgetAvailable() < MIN_RUN_BUDGET) return { reason: "budget", message: "Waiting for available spend budget" };

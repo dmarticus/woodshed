@@ -34,6 +34,8 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     @Published var notifyReady: Bool { didSet { UserDefaults.standard.set(notifyReady, forKey: "notifyReady") } }
     @Published var notifyFinished: Bool { didSet { UserDefaults.standard.set(notifyFinished, forKey: "notifyFinished") } }
     private var seen = UserDefaults.standard.dictionary(forKey: "notificationStates") as? [String: String] ?? [:]
+    private var notificationStability = NotificationStability()
+    private var notificationRecheck: Task<Void, Never>?
     private var seenFinished = Set(UserDefaults.standard.stringArray(forKey: "finishedRuns") ?? [])
     private var windows: [String: NSWindow] = [:]
     private var mainModeControl: NSSegmentedControl?
@@ -576,7 +578,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
             await updateNotifications()
         } catch { actionError = error.localizedDescription }
     }
-    private func deliver(_ record: PullRequestRecord, title: String, text: String, category: String, identifier: String) async {
+    private func deliver(_ record: PullRequestRecord, title: String, text: String, category: String, identifier: String) async -> Bool {
         let content = UNMutableNotificationContent()
         content.title = title; content.subtitle = "\(record.numberLabel) · \(record.displayTitle)"; content.body = text; content.sound = .default; content.categoryIdentifier = category
         var info: [String: Any] = ["number": record.id, "head": record.snapshot.head]
@@ -584,8 +586,8 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         if let id = record.decision.id { info["decisionId"] = id }
         if let key = record.decision.questionKey { info["questionKey"] = key }
         content.userInfo = info
-        do { try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)); track("scheduled", number: record.id, event: "notification") }
-        catch { track("failed", number: record.id, event: "notification"); actionError = "Couldn’t deliver a notification: \(error.localizedDescription)" }
+        do { try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)); track("scheduled", number: record.id, event: "notification"); return true }
+        catch { track("failed", number: record.id, event: "notification"); actionError = "Couldn’t deliver a notification: \(error.localizedDescription)"; return false }
     }
     private func updateNotifications() async {
         guard !updatingNotifications else { return }
@@ -602,15 +604,35 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         let activeKeys = Set(records.map { String($0.id) })
         let outdated = seen.keys.filter { !activeKeys.contains($0) }
         center.removeDeliveredNotifications(withIdentifiers: outdated.map { "pr-\($0)" })
-        for key in outdated { seen.removeValue(forKey: key) }
+        center.removePendingNotificationRequests(withIdentifiers: outdated.map { "pr-\($0)" })
+        notificationStability.retain(activeKeys)
+        // Retain delivered versions even when a PR leaves attention. A brief
+        // disappearance must not turn the same question into a new notification.
         for record in records {
             let run = lastRun(record)
             let version = "\(record.snapshot.head):\(record.decision.kind):\(record.decision.id ?? record.decision.reason)"
             let key = String(record.id)
             guard seen[key] != version else { continue }
+            guard notificationStability.ready(key, version: version) else {
+                if notificationRecheck == nil {
+                    notificationRecheck = Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(5))
+                        guard let self else { return }
+                        self.notificationRecheck = nil
+                        await self.updateNotifications()
+                    }
+                }
+                continue
+            }
             let category = record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : (record.decision.response == "reply" || record.decision.response == nil && record.decision.question != nil || run?.prompt?.kind == "question") ? "question" : "attention"
-            await deliver(record, title: record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.decision.question ?? record.decision.reason, category: category, identifier: "pr-\(key)")
-            seen[key] = version
+            let delivered = await deliver(record, title: record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.decision.question ?? record.decision.reason, category: category, identifier: "pr-\(key)")
+            let current = ((notifyNeeds ? attention : []) + (notifyReady ? ready : [])).first { $0.id == record.id }
+            let currentVersion = current.map { "\($0.snapshot.head):\($0.decision.kind):\($0.decision.id ?? $0.decision.reason)" }
+            if connected && currentVersion == version && delivered { seen[key] = version }
+            else {
+                center.removeDeliveredNotifications(withIdentifiers: ["pr-\(key)"])
+                center.removePendingNotificationRequests(withIdentifiers: ["pr-\(key)"])
+            }
         }
         let completed = allRuns.filter { $0.endedAt != nil }
         if !UserDefaults.standard.bool(forKey: "finishedRunsInitialized") {
@@ -619,7 +641,7 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         for run in completed where !seenFinished.contains(run.id) {
             seenFinished.insert(run.id)
             if notifyFinished && run.state == "succeeded" && !run.id.hasPrefix("ws-triage-") && !run.id.hasPrefix("jev-"), let record = state?.prs.first(where: { $0.id == run.number }), !records.contains(where: { $0.id == run.number }) {
-                await deliver(record, title: "Run finished", text: run.summary, category: "finished", identifier: "run-\(run.id)")
+                _ = await deliver(record, title: "Run finished", text: run.summary, category: "finished", identifier: "run-\(run.id)")
             }
         }
         UserDefaults.standard.set(Array(seenFinished.suffix(1000)), forKey: "finishedRuns")

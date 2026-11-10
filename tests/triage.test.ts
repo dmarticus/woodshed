@@ -286,3 +286,51 @@ test("resumed follow-ups share daily budget with other queued PRs without increa
   expect(h.store.run(source.name)?.budgetUSD).toBeCloseTo(1.46);
   expect(h.controller.budgetAvailable()).toBeCloseTo(2.54);
 });
+
+
+test.each([false, true])("verified owner escalation survives CI churn and restart (legacy=%s) until its thread changes", async legacy => {
+  const h = harness(); const record = h.store.get(42)!; record.humanHead = undefined;
+  record.snapshot.threads = [{ id: "privacy", comments: [{ author: "bot", body: "Only list connected projects", url: "https://example.com/thread" }] }];
+  const result: AssessmentResult = { ...answer("repair"), category: "review", review_threads: [{ id: "privacy", status: "needs_repair", reason: "The saved repair is not published." }] };
+  record.assessment = { head: record.snapshot.head, key: assessmentKey(record.snapshot), report: "Saved edits", result, attempts: 1, followups: 2 };
+  h.store.put(record); await h.controller.reconcile(record.snapshot);
+  const decision = h.store.get(42)!.decision;
+  expect(decision.kind).toBe("human"); expect(decision.question).toContain("two follow-ups");
+  if (legacy) { const prior = h.store.get(42)!; delete prior.assessment!.attention; h.store.put(prior); }
+  const restarted = new Controller(h.controller.config, h.store, h.controller.github, h.runner);
+  for (let i = 0; i < 4; i++) {
+    const changed = { ...record.snapshot, updatedAt: String(i), reviewRequests: ["team"], checks: [{ name: "Other shard " + i, status: "IN_PROGRESS", conclusion: "", url: "" }] };
+    await restarted.reconcile(changed, i % 2 === 0);
+    expect(h.store.get(42)!.decision).toEqual(decision);
+    expect(restarted.queueStatus(h.store.get(42)!)).toBeUndefined();
+  }
+  expect(h.launches()).toBe(0);
+  const resolved = { ...h.store.get(42)!.snapshot, threads: [] };
+  await restarted.reconcile(resolved, true);
+  expect(h.store.get(42)!.assessment?.attention).toBeUndefined();
+  expect(h.store.get(42)!.decision.kind).not.toBe("human");
+});
+
+test("an operations question remains stable through check updates and an explicit recheck releases it", async () => {
+  const h = harness(); await h.controller.prepareAttention(); await h.controller.reconcile(h.snapshot);
+  h.outcome({ state: "triaged", assessment: answer() }); await h.controller.reconcile(h.snapshot);
+  const id = h.store.get(42)!.decision.id;
+  await h.controller.reconcile({ ...h.snapshot, updatedAt: "new", checks: [] }, true);
+  expect(h.store.get(42)!.decision.id).toBe(id); expect(h.store.get(42)!.assessment?.attention).toBeDefined();
+  await h.controller.action(42, "recheck", { head: "abc" });
+  expect(h.store.get(42)!.assessment?.attention).toBeUndefined(); expect(h.store.get(42)!.decision.kind).toBe("waiting");
+});
+
+
+test("a new commit supersedes an owner escalation and a changed relevant thread triggers verification", async () => {
+  for (const change of ["head", "thread"] as const) {
+    const h = harness(); const record = h.store.get(42)!; record.humanHead = undefined;
+    record.snapshot.threads = [{ id: "privacy", comments: [] }];
+    record.assessment = { head: "abc", key: assessmentKey(record.snapshot), report: "Two follow-ups", followups: 2, attempts: 1, result: { ...answer("repair"), category: "review", review_threads: [{ id: "privacy", status: "needs_repair", reason: "Privacy boundary" }] } };
+    h.store.put(record); await h.controller.reconcile(record.snapshot);
+    const changed = change === "head" ? { ...record.snapshot, head: "new" } : { ...record.snapshot, threads: [{ id: "privacy", comments: [{ author: "owner", body: "Fixed in the current commit", url: "https://example.com/reply" }] }] };
+    await h.controller.reconcile(changed, true);
+    expect(h.store.get(42)!.assessment?.attention).toBeUndefined();
+    expect(h.store.get(42)!.decision.kind).not.toBe("human");
+  }
+});

@@ -37,8 +37,16 @@ test("native settings persist atomically and preserve repository configuration",
   expect(disk.maxAttempts).toBe(4);
   expect(disk.approvalLabel).toBe("custom-approval");
   await expect(settings.update({ automation: "yes" })).rejects.toThrow();
-  await expect(settings.update({ maxConcurrentJobs: 99 })).rejects.toThrow();
+  await expect(settings.update({ maxConcurrentJobs: 129 })).rejects.toThrow();
   await expect(settings.update({ checkout: "/unexpected" })).rejects.toThrow();
+});
+
+test("automatic concurrency and resource targets persist without changing spend caps", async () => {
+  const h = harness(); h.config.runCapUSD = 5; h.config.dailyCapUSD = 20;
+  const path = join(temp(), "config.json"); const settings = new Settings(h.config, path);
+  await settings.update({ concurrencyMode: "adaptive", cpuTargetPercent: 75, memoryTargetPercent: 80 });
+  expect(await Bun.file(path).json()).toMatchObject({ concurrencyMode: "adaptive", cpuTargetPercent: 75, memoryTargetPercent: 80, runCapUSD: 5, dailyCapUSD: 20 });
+  for (const patch of [{ concurrencyMode: "unlimited" }, { cpuTargetPercent: 101 }, { memoryTargetPercent: 100 }, { cpuTargetPercent: "80" }]) await expect(settings.update(patch)).rejects.toThrow();
 });
 
 test("global pause prevents launching new automated jobs", async () => {

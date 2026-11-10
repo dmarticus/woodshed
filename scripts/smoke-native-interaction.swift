@@ -241,6 +241,15 @@ struct InteractionSmoke {
         guard args.count == 2 else { fatalError("Expected the synthetic draft fixture") }
         var payload = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: args[1]))) as! [String: Any]
         payload["demo"] = false
+        var gate = NotificationStability()
+        let start = Date(timeIntervalSince1970: 100)
+        precondition(!gate.ready("42", version: "question", at: start))
+        precondition(!gate.ready("42", version: "question", at: start.addingTimeInterval(4)))
+        precondition(gate.ready("42", version: "question", at: start.addingTimeInterval(5)))
+        precondition(!gate.ready("42", version: "new question", at: start.addingTimeInterval(6)))
+        gate.retain([])
+        precondition(!gate.ready("42", version: "new question", at: start.addingTimeInterval(20)))
+        report("PASS: notifications wait for a stable decision and reset when attention changes or disappears")
         try checkSections(payload)
         DelayedController.server.state = payload
         URLProtocol.registerClass(DelayedController.self)

@@ -32,6 +32,8 @@ if (!/^[\w.-]+\/[\w.-]+$/.test(config.repository)) throw new Error("repository m
 if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) throw new Error("port must be 1024–65535");
 if (!Number.isFinite(config.pollSeconds) || config.pollSeconds < 30) throw new Error("pollSeconds must be at least 30");
 if (!Number.isInteger(config.maxAttempts) || config.maxAttempts < 1 || !Number.isInteger(config.maxConcurrentJobs) || config.maxConcurrentJobs < 1) throw new Error("Job limits must be positive integers");
+if (config.concurrencyMode !== undefined && !["fixed", "adaptive"].includes(config.concurrencyMode)) throw new Error("concurrencyMode must be fixed or adaptive");
+for (const [key, min, max] of [["cpuTargetPercent", 20, 95], ["memoryTargetPercent", 50, 90]] as const) if (config[key] !== undefined && (!Number.isInteger(config[key]) || config[key]! < min || config[key]! > max)) throw new Error(`${key} must be an integer between ${min} and ${max}`);
 if (typeof config.automation !== "boolean") throw new Error("automation must be a boolean");
 if (config.automation && (!isAbsolute(config.checkout) || !await Bun.file(resolve(config.checkout, "AGENTS.md")).exists())) throw new Error("Set checkout to an absolute repository path containing AGENTS.md before enabling automation");
 const store = new Store(demo ? ":memory:" : resolve(root, ".woodshed", "state.sqlite"));
@@ -67,6 +69,7 @@ if (!demo) {
   void controller.runner.models.list().catch(error => console.error(`Model catalog: ${error.message}`));
   void controller.sync();
   setInterval(() => { void controller.refreshAttention().catch(error => { controller.error = error.message; }); }, 30_000);
+  setInterval(() => { void controller.fillWorkers(); }, 2_000);
   setInterval(() => { void controller.checkBudgets().catch(error => { controller.error = error.message; }); }, 1000);
   const schedule = (): void => { setTimeout(() => { controller.error = null; void controller.sync().finally(schedule); }, config.pollSeconds * 1000); };
   schedule();

@@ -19,7 +19,7 @@ export function remainingRepairDecision(pr: Snapshot, result: AssessmentResult):
     kind: "human", response: "retry",
     title: finding ? "Review feedback still needs a fix" : check ? "CI still needs a fix" : pr.mergeable === "CONFLICTING" ? "A merge conflict still needs a fix" : "The repair needs your help",
     reason: finding?.reason ?? "Woodshed stopped after repeated attempts to finish this repair.",
-    question: "Review what remains, then retry with instructions or finish the fix yourself.",
+    question: "Woodshed stopped after two follow-ups. Review the remaining issue, then retry with instructions or finish the fix yourself.",
     action: { label: thread ? "Open review feedback" : check?.url ? "Open failed check" : "Open pull request", url: thread?.comments[0]?.url ?? (check?.url || pr.url) },
   };
 }

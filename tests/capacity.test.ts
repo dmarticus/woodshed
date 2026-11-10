@@ -15,15 +15,22 @@ function fixture(cap = 4.57, limit = 3) {
   return { store, controller, launches: () => launches };
 }
 
-test("4 CPU / 8 GB VM allows three workers with memory headroom", () => {
-  expect(capacityFor(8, { cpus: 4, totalGB: 7.75, availableGB: 6.9, load: 0.4 })).toMatchObject({ limit: 3, blocked: undefined });
-  expect(capacityFor(2, { cpus: 4, totalGB: 7.75, availableGB: 6.9, load: 0.4 }).limit).toBe(2);
-  expect(capacityFor(8, { cpus: 8, totalGB: 15.6, availableGB: 13, load: 2 }).limit).toBe(7);
+test("automatic admission can exceed both the old manual limit and CPU count", () => {
+  const capacity = capacityFor(3, { cpus: 4, totalGB: 8, availableGB: 7, load: 0.4, cpuPercent: 10 }, { active: 4, concurrencyMode: "adaptive" });
+  expect(capacity.limit).toBe(14); expect(capacity.blocked).toBeUndefined();
+  expect(capacityFor(3, { cpus: 4, totalGB: 8, availableGB: 7, load: 0.4 }, { active: 1, concurrencyMode: "fixed" }).limit).toBe(3);
 });
 
-test.each(["cpu", "memory"] as const)("temporary %s pressure pauses starts without changing configured concurrency", pressure => {
-  const host = { cpus: 4, totalGB: 8, availableGB: pressure === "memory" ? 1 : 7, load: pressure === "cpu" ? 5 : 1 };
-  expect(capacityFor(3, host)).toMatchObject({ limit: 3, blocked: pressure });
+test.each(["cpu", "memory"] as const)("automatic admission pauses under measured %s pressure", pressure => {
+  const host = { cpus: 4, totalGB: 8, availableGB: pressure === "memory" ? 1.8 : 7, load: 0.1, cpuPercent: pressure === "cpu" ? 85 : 10 };
+  expect(capacityFor(3, host, { active: 6, concurrencyMode: "adaptive" }).blocked).toBe(pressure);
+});
+
+test("memory reclaimed by a finished task immediately expands admission headroom", () => {
+  const host = { cpus: 2, totalGB: 8, availableGB: 2.2, load: 0.1 };
+  const policy = { active: 5, concurrencyMode: "adaptive" as const, memoryTargetPercent: 80 };
+  expect(capacityFor(3, host, policy).limit).toBe(6);
+  expect(capacityFor(3, { ...host, availableGB: 4.2 }, policy).limit).toBe(10);
 });
 
 test("independent repairs share the remaining daily allowance and fill three slots", async () => {
@@ -83,4 +90,35 @@ test("active job allocations override stale resumed-worker budget telemetry in e
   expect(f.controller.budgetAvailable()).toBe(18);
   record.job!.budgetUSD = 6; f.store.put(record); run.budgetUSD = 2; f.store.saveRun(run);
   expect(f.controller.budgetAvailable()).toBe(14);
+});
+
+test("scheduler ramps past the CPU count, checks fresh snapshots, and honors resource backpressure", async () => {
+  const f = fixture(20); const c = f.controller; let clock = Date.now(); let pressured = false; let reads = 0;
+  c.config.concurrencyMode = "adaptive";
+  (c as any).now = () => clock;
+  (c as any).resources = (configured: number, policy: any) => capacityFor(configured, { cpus: 2, totalGB: 8, availableGB: 7, load: 0, cpuPercent: pressured ? 90 : 5 }, policy);
+  (c.github as any).snapshot = async (number: number) => { reads++; return f.store.get(number)!.snapshot; };
+  for (const n of [4, 5, 6]) { const pr = snapshot(n); f.store.put({ snapshot: pr, paused: false, attempts: 0, fingerprint: fingerprint(pr), decision: { kind: "fix", reason: "Tests failed" } }); }
+  await c.fillWorkers(); expect(c.activeSlots()).toBe(1);
+  await c.fillWorkers(); expect(c.activeSlots()).toBe(1); expect(reads).toBe(1);
+  clock += 6000; pressured = true; await c.fillWorkers(); expect(reads).toBe(1);
+  pressured = false;
+  for (let i = 0; i < 5; i++) { clock += 6000; await c.fillWorkers(); }
+  expect(c.activeSlots()).toBe(6); expect(reads).toBe(6);
+  expect(c.budgetAvailable()).toBeGreaterThanOrEqual(0);
+});
+
+
+test("a slow checkout does not block preparation of another independent PR", async () => {
+  const f = fixture(20); let clock = Date.now(); let release!: () => void;
+  const preparation = new Promise<void>(resolve => { release = resolve; });
+  const c = f.controller; c.config.concurrencyMode = "adaptive";
+  (c as any).now = () => clock;
+  (c.github as any).snapshot = async (n: number) => f.store.get(n)!.snapshot;
+  (c.runner as any).launch = async (pr: Snapshot) => { if (pr.number === 1) await preparation; };
+  const first = c.fillWorkers();
+  for (let i = 0; i < 10 && !f.store.get(1)!.job; i++) await Promise.resolve();
+  expect(c.activeSlots()).toBe(1);
+  clock += 6000; await c.fillWorkers(); expect(c.activeSlots()).toBe(2);
+  release(); await first;
 });
