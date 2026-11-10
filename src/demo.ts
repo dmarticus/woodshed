@@ -1,5 +1,19 @@
 import { Outcomes } from "./outcomes";
 import type { Record, Snapshot } from "./model";
+import type { ReviewerSuggestion } from "./reviewers";
+
+export function demoReviewerSuggestions(): { suggestions: ReviewerSuggestion[]; requested: string[]; partial: boolean } {
+  return {
+    suggestions: [
+      { handle: "example/team-reports", name: "Team Reports", kind: "team", source: "code_owner" },
+      { handle: "casey-lee", name: "Casey Lee", kind: "person", source: "github" },
+      { handle: "jordan-kim", name: "Jordan Kim", kind: "person", source: "github" },
+      { handle: "example/team-platform", name: "Team Platform", kind: "team", source: "repository" },
+    ],
+    requested: [],
+    partial: false,
+  };
+}
 
 export function demoRecords(): Record[] {
   const base: Snapshot = { number: 101, title: "Handle empty export results", url: "https://github.com/example/project/pull/101", head: "demo-commit", branch: "fix/empty-export", base: "main", state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: [{ name: "Backend tests", status: "COMPLETED", conclusion: "SUCCESS", url: "" }], threads: [], labels: [], reviews: [] };

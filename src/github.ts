@@ -4,6 +4,7 @@ import type { Config, Snapshot, ReviewThreadAssessment } from "./model";
 import { diagnosticText, namedTestFailures, type CIEvidence, type CheckFailureReport } from "./check-evidence";
 import { failed, currentChecks } from "./model";
 import { infrastructureKind, type InfrastructureSignal } from "./ci-incidents";
+import { matchingCodeOwners, reviewerHandle, type ReviewerSuggestion } from "./reviewers";
 
 export class GitHub {
   constructor(readonly config: Config, readonly exec: typeof command = command) {}
@@ -348,8 +349,71 @@ export class GitHub {
     await this.label(number, label);
   }
   async requestReviewer(number: number, reviewer: string): Promise<void> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\/[A-Za-z0-9][A-Za-z0-9-]{0,99})?$/.test(reviewer)) throw new Error("Enter a GitHub username or organization/team");
+    if (!reviewerHandle.test(reviewer)) throw new Error("Enter a GitHub username or organization/team");
     await this.request(["gh", "pr", "edit", String(number), "--repo", this.config.repository, "--add-reviewer", reviewer]);
+  }
+  async reviewerSuggestions(number: number, expectedHead: string): Promise<{ suggestions: ReviewerSuggestion[]; requested: string[]; partial: boolean }> {
+    const [owner, repo] = this.config.repository.split("/");
+    const query = `query($owner:String!,$repo:String!,$number:Int!){
+      viewer{login}
+      repository(owner:$owner,name:$repo){
+        pullRequest(number:$number){
+          state isDraft headRefOid baseRefOid changedFiles author{login}
+          suggestedReviewers{reviewer{login name}}
+          reviewRequests(first:100){nodes{requestedReviewer{
+            ... on User{login} ... on Team{slug organization{login}}
+          }}}
+        }
+      }
+    }`;
+    const result = JSON.parse(await this.request(["gh", "api", "graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `repo=${repo}`, "-F", `number=${number}`]));
+    const pr = result.data?.repository?.pullRequest;
+    if (pr?.state !== "OPEN" || pr.isDraft || pr.headRefOid !== expectedHead) throw Error("This PR changed. Refresh it and open Request review again.");
+    const requested: string[] = (pr.reviewRequests?.nodes ?? []).flatMap((item: any) => {
+      const reviewer = item?.requestedReviewer;
+      const handle = reviewer?.login ?? (reviewer?.organization?.login && reviewer?.slug ? `${reviewer.organization.login}/${reviewer.slug}` : undefined);
+      return handle && reviewerHandle.test(handle) ? [handle] : [];
+    });
+    const excluded = new Set([...requested, pr.author?.login, result.data?.viewer?.login].filter(Boolean).map(login => login.toLowerCase()));
+
+    const [owners, teams] = await Promise.allSettled([
+      this.codeOwners(number, pr.baseRefOid, pr.changedFiles),
+      this.conditionalJSON(`repos/${this.config.repository}/teams?per_page=100`),
+    ]);
+    const teamRows: { slug: string; name: string; permission?: string; permissions?: { push?: boolean } }[] =
+      teams.status === "fulfilled" && Array.isArray(teams.value) ? teams.value : [];
+    const teamName = new Map(teamRows.map(team => [`${owner}/${team.slug}`.toLowerCase(), team.name]));
+    const suggestions = new Map<string, ReviewerSuggestion>();
+    const add = (handle: string, source: ReviewerSuggestion["source"], name?: string) => {
+      if (!reviewerHandle.test(handle)) return;
+      const key = handle.toLowerCase();
+      if (excluded.has(key) || suggestions.has(key)) return;
+      suggestions.set(key, { handle, name, kind: handle.includes("/") ? "team" : "person", source });
+    };
+    const people: { reviewer: { login: string; name: string | null } }[] = pr.suggestedReviewers ?? [];
+    const peopleNames = new Map(people.map(({ reviewer }) => [reviewer.login.toLowerCase(), reviewer.name]));
+    if (owners.status === "fulfilled") {
+      for (const handle of owners.value) add(handle, "code_owner", teamName.get(handle.toLowerCase()) ?? peopleNames.get(handle.toLowerCase()) ?? undefined);
+    }
+    for (const { reviewer } of people) add(reviewer.login, "github", reviewer.name ?? undefined);
+    for (const team of teamRows) {
+      if (team.permissions?.push || ["push", "admin", "maintain"].includes(team.permission ?? "")) add(`${owner}/${team.slug}`, "repository", team.name);
+    }
+    return { suggestions: [...suggestions.values()], requested, partial: owners.status === "rejected" || teams.status === "rejected" };
+  }
+  private async codeOwners(number: number, base: string, count: number): Promise<string[]> {
+    if (!/^[a-f0-9]{40}$/.test(base) || !Number.isInteger(count) || count > 3000) throw Error("Changed files or base revision unavailable");
+    if (count === 0) return [];
+    for (const path of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
+      let file;
+      try { file = await this.conditionalJSON(`repos/${this.config.repository}/contents/${path}?ref=${base}`); }
+      catch (error) { if (/\bHTTP\s+404\b/.test(String(error))) continue; throw error; }
+      if (file.encoding !== "base64" || typeof file.content !== "string") throw Error("CODEOWNERS could not be read");
+      const files = await this.changedFiles(number, count);
+      if (files.length !== count) throw Error("The PR's changed files are incomplete");
+      return matchingCodeOwners(Buffer.from(file.content, "base64").toString("utf8"), files);
+    }
+    return [];
   }
   async markReady(number: number, expectedHead: string): Promise<void> {
     const current = await this.snapshot(number);

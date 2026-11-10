@@ -176,7 +176,6 @@ struct MainView: View {
 struct PRSidebar: View {
     @ObservedObject var model: InboxModel
     @State private var reviewTarget: PullRequestRecord?
-    @State private var reviewer = ""
     var body: some View {
         VStack(spacing: 0) {
             List(selection: Binding(get: { model.selectedNumber }, set: { if let number = $0 { model.selectedNumber = number } })) {
@@ -224,15 +223,8 @@ struct PRSidebar: View {
                 HStack { Button("All runs") { model.selectedNumber = nil }.buttonStyle(.link); Spacer(); Button { model.showSettings() } label: { Image(systemName: "gearshape") }.buttonStyle(.borderless) }
             }.padding(12)
         }.frame(maxHeight: .infinity).background(Color(nsColor: .windowBackgroundColor))
-        .alert("Request review", isPresented: Binding(get: { reviewTarget != nil }, set: { if !$0 { reviewTarget = nil } })) {
-            TextField("GitHub username or organization/team", text: $reviewer)
-            Button("Cancel", role: .cancel) { reviewTarget = nil }
-            Button("Request review") {
-                if let record = reviewTarget {
-                    Task { _ = await model.act("reviewer", on: record, reviewer: reviewer) }
-                }
-                reviewTarget = nil
-            }.disabled(reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || reviewTarget.map { !model.canAct(on: $0) } != false)
+        .sheet(item: $reviewTarget) { record in
+            ReviewRequestSheet(model: model, record: record)
         }
     }
     private func sidebarRow(_ record: PullRequestRecord, attention: Bool = false, running: Bool = false, selectable: Bool = false) -> some View {
@@ -279,20 +271,162 @@ struct PRSidebar: View {
                     Button("Convert to draft") { Task { await model.act("mark-draft", on: record) } }.disabled(!model.canAct(on: record))
                 }
                 if !record.snapshot.draft && record.isWatched { Button("Start task…") { model.startTask(record) } }
-                Button("Request review…") { reviewer = ""; reviewTarget = record }.disabled(!model.canAct(on: record))
+                Button("Request review…") { reviewTarget = record }.disabled(!model.canChooseReviewer(record))
                 Button("Request Stamphog approval") { Task { await model.act("request-approval", on: record) } }.disabled(!model.canRequestApproval(record)).help(record.approval?.reason ?? "Refresh this PR to check approval availability")
                 Divider()
                 Button("Copy PR link") { model.track("copy_pr_link", number: record.id); model.copy(record.snapshot.url) }
             }
     }
 }
+struct ReviewRequestSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var searchFocused: Bool
+    @ObservedObject var model: InboxModel
+    let record: PullRequestRecord
+    @State private var query = ""
+    @State private var selection: String?
+    @State private var result: ReviewerSuggestions?
+    @State private var loading = true
+    @State private var loadError: String?
+    @State private var requestError: String?
+    @State private var reload = 0
+
+    private var current: PullRequestRecord? {
+        model.state?.prs.first { $0.id == record.id && $0.snapshot.head == record.snapshot.head && $0.snapshot.state == "OPEN" && !$0.snapshot.draft }
+    }
+    private var search: String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("@") ? String(trimmed.dropFirst()) : trimmed
+    }
+    private var matches: [ReviewerSuggestions.Candidate] {
+        (result?.suggestions ?? []).filter {
+            search.isEmpty || $0.handle.localizedCaseInsensitiveContains(search) || $0.name?.localizedCaseInsensitiveContains(search) == true
+        }
+    }
+    private var manualHandle: String? {
+        guard search.range(of: #"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(/[A-Za-z0-9][A-Za-z0-9-]{0,99})?$"#, options: .regularExpression) != nil,
+              !(result?.suggestions.contains { $0.handle.caseInsensitiveCompare(search) == .orderedSame } ?? false),
+              !(result?.requested.contains { $0.caseInsensitiveCompare(search) == .orderedSame } ?? false)
+        else { return nil }
+        return search
+    }
+    private var recipient: String? {
+        guard let selection else { return nil }
+        return matches.contains { $0.handle == selection } || manualHandle == selection ? selection : nil
+    }
+    private var submitting: Bool { model.pendingActions[record.id] == "reviewer" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Request review").font(.headline)
+                Text("\(record.numberLabel) · \(record.displayTitle)")
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
+            }
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+                TextField("Search people or teams", text: $query)
+                    .focused($searchFocused)
+                    .onChange(of: query) { _, _ in selection = nil; requestError = nil }
+            }.disabled(submitting)
+            List(selection: $selection) {
+                let suggested = matches.filter { $0.source != "repository" }
+                let teams = matches.filter { $0.source == "repository" }
+                if !suggested.isEmpty {
+                    Section("Suggested for this PR") { ForEach(suggested) { candidateRow($0) } }
+                }
+                if !teams.isEmpty {
+                    Section("Repository teams") { ForEach(teams) { candidateRow($0) } }
+                }
+                if let manualHandle {
+                    Label("Use @\(manualHandle)", systemImage: "plus.circle").tag(manualHandle)
+                }
+            }
+            .listStyle(.inset)
+            .frame(height: 270)
+            .disabled(submitting)
+            .overlay {
+                if matches.isEmpty && manualHandle == nil {
+                    if loading { ProgressView("Loading reviewers…").controlSize(.small) }
+                    else {
+                        let alreadyRequested = result?.requested.contains { $0.caseInsensitiveCompare(search) == .orderedSame } == true
+                        Text(alreadyRequested ? "Review already requested" : search.isEmpty ? "Enter a GitHub username or organization/team." : "No matching reviewers")
+                            .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).padding()
+                    }
+                }
+            }
+            if search.isEmpty, let requested = result?.requested, !requested.isEmpty {
+                let handles = requested.map { "@\($0)" }.joined(separator: ", ")
+                Label("Already requested · \(handles)", systemImage: "checkmark.circle")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).help(handles)
+            }
+            if let loadError {
+                HStack {
+                    Text(loadError).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry") { reload += 1 }.buttonStyle(.link).disabled(submitting)
+                }
+            }
+            if current == nil {
+                Text("This PR changed. Refresh it and open Request review again.").font(.callout).foregroundStyle(.secondary)
+            } else if let requestError {
+                Text(requestError).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            HStack(spacing: 10) {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction).disabled(submitting)
+                Button(submitting ? "Requesting…" : "Request review") {
+                    guard let current, let recipient else { return }
+                    Task {
+                        requestError = nil
+                        if await model.act("reviewer", on: current, reviewer: recipient) { dismiss() }
+                        else { requestError = model.prActionErrors[record.id] }
+                    }
+                }.keyboardShortcut(.defaultAction)
+                    .disabled(model.preview || recipient == nil || current.map { !model.canAct(on: $0) } != false)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 440, idealWidth: 460)
+        .interactiveDismissDisabled(submitting)
+        .onAppear { searchFocused = true }
+        .task(id: reload) {
+            loading = true
+            loadError = nil
+            defer { loading = false }
+            do {
+                let response = try await model.reviewerSuggestions(for: record)
+                guard !Task.isCancelled else { return }
+                result = response
+                if response.partial { loadError = "Some GitHub suggestions couldn’t be loaded." }
+            } catch {
+                if !Task.isCancelled { loadError = "Couldn’t load suggestions. You can enter a GitHub handle." }
+            }
+        }
+    }
+
+    private func candidateRow(_ candidate: ReviewerSuggestions.Candidate) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: candidate.kind == "team" ? "person.2" : "person")
+                .frame(width: 20).foregroundStyle(.secondary).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(candidate.name ?? candidate.handle).lineLimit(1)
+                if candidate.name != nil { Text("@\(candidate.handle)").font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+            }
+            Spacer(minLength: 8)
+            if candidate.source == "code_owner" { Text("Code owner").font(.caption).foregroundStyle(.secondary) }
+        }
+        .padding(.vertical, 3)
+        .tag(candidate.handle)
+    }
+}
+
 struct PRDetailView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var model: InboxModel
     @State private var showChecks: Bool
     @State private var showReview: Bool
-    @State private var reviewer = ""
-    @State private var requestingReviewer = false
+    @State private var reviewTarget: PullRequestRecord?
     @FocusState private var answerFocused: Bool
     @State private var composerNumber: Int?
     init(model: InboxModel, initialTab: String = "agent") { self.model = model; _showChecks = State(initialValue: initialTab == "checks"); _showReview = State(initialValue: initialTab == "review") }
@@ -330,7 +464,6 @@ struct PRDetailView: View {
                             }
                         }
                     }
-                    if requestingReviewer { HStack { TextField("GitHub username or organization/team", text: $reviewer).textFieldStyle(.roundedBorder); Button("Request review") { Task { if await model.act("reviewer", on: record, reviewer: reviewer) { reviewer = ""; requestingReviewer = false } } }.disabled(!model.canAct(on: record) || reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
                     if showChecks { CheckSummaryView(record: record, model: model) }
                     if showReview { ReviewThreadsView(record: record, model: model) }
                     if canCompose(record) && record.mergeQueue?.active != true {
@@ -361,6 +494,9 @@ struct PRDetailView: View {
                     }
                 }.frame(maxWidth: 900, alignment: .topLeading).padding(24).frame(maxWidth: .infinity, alignment: .topLeading)
             }.frame(minWidth: 410, minHeight: 440).background(Color(nsColor: .windowBackgroundColor))
+                .sheet(item: $reviewTarget) { target in
+                    ReviewRequestSheet(model: model, record: target)
+                }
                 .task(id: record.job?.name) {
                     await model.loadAgent()
                     if model.startTaskNumber == record.id {
@@ -394,7 +530,7 @@ struct PRDetailView: View {
                 Button { Task { await model.recheck(record) } } label: { Image(systemName: "arrow.clockwise") }
                     .disabled(!model.canAct(on: record)).help("Refresh this PR (⌘R)").accessibilityLabel("Refresh this PR")
                 Menu {
-                    Button("Request review…") { requestingReviewer.toggle() }.disabled(!model.canAct(on: record))
+                    Button("Request review…") { reviewTarget = record }.disabled(!model.canChooseReviewer(record))
                     Button("Request Stamphog approval") { Task { await model.act("request-approval", on: record) } }.disabled(!model.canRequestApproval(record)).help(record.approval?.reason ?? "Refresh this PR to check approval availability")
                     Button("Copy PR link") { model.track("copy_pr_link", number: record.id); model.copy(record.snapshot.url) }
                     Divider()

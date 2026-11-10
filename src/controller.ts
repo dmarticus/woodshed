@@ -830,7 +830,7 @@ export class Controller {
     }
     if (["reply", "confirm-reply", "topup", "reviewer", "retry", "resume", "watch", "recheck"].includes(action)) {
       const live = await this.github.snapshot(number);
-      if (live.head !== record.snapshot.head || live.state !== record.snapshot.state || ["reply", "confirm-reply", "recheck"].includes(action)) {
+      if (live.head !== record.snapshot.head || live.state !== record.snapshot.state || live.draft !== record.snapshot.draft || ["reply", "confirm-reply", "recheck"].includes(action)) {
         await this.reconcile(live, true);
         record = this.store.get(number)!;
       }

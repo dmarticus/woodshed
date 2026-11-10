@@ -299,5 +299,17 @@ struct AgentSnapshot: Decodable, Sendable {
     var needsTerminal: Bool { state == "blocked" && kind != "question" }
 }
 struct APIAcknowledgement: Decodable, Sendable { let ok: Bool }
+struct ReviewerSuggestions: Decodable, Sendable {
+    struct Candidate: Decodable, Identifiable, Sendable {
+        let handle: String
+        let name: String?
+        let kind: String
+        let source: String
+        var id: String { handle.lowercased() }
+    }
+    let suggestions: [Candidate]
+    let requested: [String]
+    let partial: Bool
+}
 struct APIError: Decodable, Sendable { let error: String }
 struct ServiceError: LocalizedError, Sendable { let message: String; var errorDescription: String? { message } }

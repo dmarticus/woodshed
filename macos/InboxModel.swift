@@ -147,6 +147,9 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     var refreshingPR: Bool { selectedNumber.map { pendingActions[$0] == "recheck" } ?? false }
     var canAct: Bool { connected && (preview || state?.demo != true) && !actionPending }
     func canAct(on record: PullRequestRecord) -> Bool { connected && (preview || state?.demo != true) && pendingActions[record.id] == nil }
+    func canChooseReviewer(_ record: PullRequestRecord) -> Bool {
+        connected && pendingActions[record.id] == nil && record.snapshot.state == "OPEN" && !record.snapshot.draft
+    }
     func canRequestApproval(_ record: PullRequestRecord) -> Bool {
         canAct(on: record) && record.approval?.head == record.snapshot.head && record.approval?.canRequest == true
     }
@@ -205,24 +208,30 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         return "Est. today \(currency(spend.spentUSD)) of \(currency(spend.capUSD)) · \(spend.runs) runs"
     }
 
-    private func authenticatedRequest(_ path: String, method: String = "GET", body: [String: Any]? = nil) throws -> URLRequest {
+    private func authenticatedRequest(_ path: String, method: String = "GET", body: [String: Any]? = nil, query: [URLQueryItem] = []) throws -> URLRequest {
         if let connectionConfigError { throw ServiceError(message: connectionConfigError) }
         guard baseURL.scheme == "http", baseURL.host == "127.0.0.1" else { throw ServiceError(message: "Woodshed requires a local controller") }
         let token = try String(contentsOf: tokenURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         guard token.count == 64 else { throw ServiceError(message: "The controller credential is unavailable. Restart Woodshed’s controller.") }
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        if !query.isEmpty { components?.queryItems = query }
+        guard let url = components?.url else { throw ServiceError(message: "Invalid controller URL") }
+        var request = URLRequest(url: url)
         request.httpMethod = method; request.timeoutInterval = 30; request.cachePolicy = .reloadIgnoringLocalCacheData; request.httpShouldHandleCookies = false
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         if let body { request.httpBody = try JSONSerialization.data(withJSONObject: body); request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         return request
     }
-    private func request<T: Decodable & Sendable>(_ path: String, method: String = "GET", body: [String: Any]? = nil) async throws -> T {
-        let request = try authenticatedRequest(path, method: method, body: body)
+    private func request<T: Decodable & Sendable>(_ path: String, method: String = "GET", body: [String: Any]? = nil, query: [URLQueryItem] = []) async throws -> T {
+        let request = try authenticatedRequest(path, method: method, body: body, query: query)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw ServiceError(message: (try? JSONDecoder().decode(APIError.self, from: data))?.error ?? "The controller couldn’t complete this request.")
         }
         return try await Task.detached(priority: .userInitiated) { try JSONDecoder().decode(T.self, from: data) }.value
+    }
+    func reviewerSuggestions(for record: PullRequestRecord) async throws -> ReviewerSuggestions {
+        try await request("api/prs/\(record.id)/reviewer-suggestions", query: [URLQueryItem(name: "head", value: record.snapshot.head)])
     }
     func run() async {
         await refresh()

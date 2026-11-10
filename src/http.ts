@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import type { Settings } from "./settings";
 import { AgentAPI } from "./agent-api";
 import { readiness, readinessSummary } from "./readiness";
+import { demoReviewerSuggestions } from "./demo";
 
 export function handler(controller: Controller, settings: Settings, token = randomBytes(32).toString("hex"), events = new StateEvents()): (request: Request) => Promise<Response> {
   const origin = `http://127.0.0.1:${controller.config.port}`;
@@ -34,6 +35,15 @@ export function handler(controller: Controller, settings: Settings, token = rand
       }
       if (request.method === "GET" && url.pathname === "/api/models") return json({ models: await controller.runner.models.list() });
       if (request.method === "GET" && url.pathname === "/") return json({ service: "Woodshed", interface: "macOS menu bar", status: "running" });
+      const reviewers = url.pathname.match(/^\/api\/prs\/(\d+)\/reviewer-suggestions$/);
+      if (request.method === "GET" && reviewers) {
+        const record = controller.store.get(Number(reviewers[1]));
+        if (!record) return json({ error: "PR not found" }, 404);
+        const head = url.searchParams.get("head");
+        if (!head || head !== record.snapshot.head || record.snapshot.state !== "OPEN" || record.snapshot.draft)
+          return json({ error: "This PR changed. Refresh it and open Request review again." }, 409);
+        return json(settings.demo ? demoReviewerSuggestions() : await controller.github.reviewerSuggestions(record.snapshot.number, head));
+      }
       const agent = url.pathname.match(/^\/api\/prs\/(\d+)\/agent$/);
       if (request.method === "GET" && agent) {
         const record = controller.store.get(Number(agent[1]));

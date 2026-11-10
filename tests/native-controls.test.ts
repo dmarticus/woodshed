@@ -8,6 +8,7 @@ import { Settings } from "../src/settings";
 import { handler } from "../src/http";
 import { Runner } from "../src/runner";
 import { GitHub } from "../src/github";
+import { matchingCodeOwners } from "../src/reviewers";
 import type { Config, Snapshot, Job } from "../src/model";
 
 const roots: string[] = [];
@@ -106,6 +107,60 @@ test("reviewer input is validated before invoking GitHub", async () => {
   expect(calls).toEqual([]);
   await github.requestReviewer(42, "sample-reviewer");
   expect(calls[0].at(-1)).toBe("sample-reviewer");
+});
+
+test("CODEOWNERS suggestions use the last matching rule for each changed file", () => {
+  const codeowners = `
+* @example/general
+/src/ @example/backend
+/src/**/reports?.ts @example/reports @reports-maintainer # inline comment
+/src/generated/
+docs/ @example/docs
+*.lock release@example.com
+`;
+  expect(matchingCodeOwners(codeowners, ["src/reports1.ts", "src/api/reports2.ts", "src/api/handlers.ts", "src/generated/schema.ts", "web/docs/help.md", "bun.lock"]))
+    .toEqual(["example/reports", "reports-maintainer", "example/backend", "example/docs"]);
+});
+
+test("reviewer suggestions prioritize matching owners and omit the author and requested reviewers", async () => {
+  const base = "b".repeat(40);
+  const calls: string[][] = [];
+  const github = new GitHub({ repository: "example/project" } as Config, async argv => {
+    calls.push(argv);
+    if (argv.includes("graphql")) return JSON.stringify({ data: { viewer: { login: "me" }, repository: { pullRequest: {
+      state: "OPEN", isDraft: false, headRefOid: "a", baseRefOid: base, changedFiles: 1, author: { login: "author" },
+      reviewRequests: { nodes: [{ requestedReviewer: { slug: "already", organization: { login: "Example" } } }] },
+      suggestedReviewers: [
+        { reviewer: { login: "me" } }, { reviewer: { login: "Author" } }, { reviewer: { login: "casey", name: "Casey" } },
+      ],
+    } } } });
+    if (argv.some(a => a.includes(`/contents/.github/CODEOWNERS?ref=${base}`))) {
+      return JSON.stringify({ encoding: "base64", content: Buffer.from("/src/ @example/owners @example/already @author @me").toString("base64") });
+    }
+    if (argv.some(a => a.includes("/pulls/42/files?"))) return JSON.stringify([{ filename: "src/report.ts" }]);
+    if (argv.some(a => a.includes("/teams?"))) return JSON.stringify([
+      { slug: "owners", name: "Report owners", permission: "push" }, { slug: "readers", permission: "pull" }, { slug: "other", name: "Other team", permission: "maintain" },
+    ]);
+    throw Error("Unexpected command");
+  });
+  const h = harness();
+  h.controller.github.reviewerSuggestions = github.reviewerSuggestions.bind(github);
+  const route = handler(h.controller, new Settings(h.config, join(temp(), "config.json")), "fixture-token");
+  const request = (head: string, token = "fixture-token") => new Request(`http://127.0.0.1:7341/api/prs/42/reviewer-suggestions?head=${head}`, { headers: { Host: "127.0.0.1:7341", Authorization: `Bearer ${token}` } });
+  expect((await route(request("a", "wrong-token"))).status).toBe(401);
+  expect((await route(request("old"))).status).toBe(409);
+  expect(calls).toEqual([]);
+  expect(await (await route(request("a"))).json()).toMatchObject({
+    partial: false, requested: ["Example/already"],
+    suggestions: [
+      { handle: "example/owners", name: "Report owners", source: "code_owner" },
+      { handle: "casey", name: "Casey", source: "github" },
+      { handle: "example/other", name: "Other team", source: "repository" },
+    ],
+  });
+  expect(h.calls).toEqual([]);
+  await h.controller.action(42, "reviewer", { head: "a", reviewer: "example/owners" });
+  expect(h.calls).toEqual(["reviewer:example/owners"]);
 });
 
 test("agent replies never bypass a permission or authentication prompt", async () => {
