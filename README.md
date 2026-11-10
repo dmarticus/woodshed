@@ -1,6 +1,6 @@
 # Woodshed
 
-A personal PR caretaker with a native macOS app. Woodshed watches your non-draft GitHub PRs, coordinates coding sessions through Herdr Core, and brings human decisions to your inbox.
+A PR caretaker with a native macOS app. Woodshed watches your non-draft GitHub PRs, coordinates coding sessions through Herdr Core, and brings human decisions to your inbox.
 
 The controller runs on your Mac or an always-on Linux VM. Closing a window or quitting the Mac app does not stop maintenance. With the controller on a VM, maintenance also continues while your Mac is asleep or shut down.
 
