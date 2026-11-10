@@ -8,7 +8,7 @@ cat > .woodshed/InteractionSmoke.app/Contents/Info.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>InteractionSmoke</string><key>CFBundleIdentifier</key><string>dev.woodshed.interaction-smoke</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>
 PLIST
 codesign --force --sign - .woodshed/InteractionSmoke.app
-if .woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json; then
+if SWIFT_BACKTRACE=enable=yes,interactive=no .woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json; then
   exit 0
 else
   status=$?
@@ -16,5 +16,9 @@ else
   for report in "$HOME"/Library/Logs/DiagnosticReports/InteractionSmoke*.ips; do
     if [ -f "$report" ]; then cat "$report"; fi
   done
+  if [ "${CI:-}" = "true" ]; then
+    /usr/bin/log show --last 2m --predicate 'process == "InteractionSmoke"' --style compact | tail -80 || true
+    xcrun lldb --batch -o run -o 'thread backtrace all' -- .woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json || true
+  fi
   exit "$status"
 fi
