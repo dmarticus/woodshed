@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
@@ -42,7 +42,7 @@ jobs:
     outputs:
       version: ${{ steps.identity.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
@@ -60,7 +60,7 @@ jobs:
         run: sh scripts/check-native-interaction.sh
       - name: Archive app bundle
         run: ditto -c -k --sequesterRsrc --keepParent dist/Woodshed.app dist/Woodshed-macos-arm64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: mac-app
           path: dist/Woodshed-macos-arm64.zip

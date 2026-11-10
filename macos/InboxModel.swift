@@ -215,8 +215,8 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     func run() async {
         await refresh()
         if !preview && state?.demo != true {
-            let settings = await UNUserNotificationCenter.current().notificationSettings()
-            if settings.authorizationStatus == .notDetermined { await enableNotifications() }
+            let authorization = await notificationAuthorization()
+            if authorization.notDetermined { await enableNotifications() }
         }
         var retry = 1
         while !Task.isCancelled && !preview {
@@ -543,11 +543,24 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
             UNNotificationCategory(identifier: "finished", actions: [open], intentIdentifiers: [])
         ])
     }
+    // Older Apple SDKs do not mark UNNotificationSettings as Sendable. Extract
+    // plain values in its callback instead of moving the object onto MainActor.
+    private func notificationAuthorization() async -> (notDetermined: Bool, denied: Bool, authorized: Bool) {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: (
+                    settings.authorizationStatus == .notDetermined,
+                    settings.authorizationStatus == .denied,
+                    settings.authorizationStatus == .authorized
+                ))
+            }
+        }
+    }
     func enableNotifications() async {
         guard !preview else { return }
         do {
-            let settings = await UNUserNotificationCenter.current().notificationSettings()
-            if settings.authorizationStatus == .denied {
+            let authorization = await notificationAuthorization()
+            if authorization.denied {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") { NSWorkspace.shared.open(url) }
                 return
             }
@@ -574,9 +587,9 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         let center = UNUserNotificationCenter.current()
         if Date().timeIntervalSince(lastNotificationCheck) > 30 {
             lastNotificationCheck = Date()
-            let authorization = await center.notificationSettings().authorizationStatus
-            notificationsEnabled = authorization == .authorized
-            notificationPermission = authorization == .denied ? "denied" : authorization == .authorized ? "authorized" : "unknown"
+            let authorization = await notificationAuthorization()
+            notificationsEnabled = authorization.authorized
+            notificationPermission = authorization.denied ? "denied" : authorization.authorized ? "authorized" : "unknown"
         }
         guard connected, state?.demo != true, !preview, notificationsEnabled else { return }
         let records = (notifyNeeds ? attention : []) + (notifyReady ? ready : [])
