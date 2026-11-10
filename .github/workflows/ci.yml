@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      version:
+        description: Version of the tested Mac build
+        value: ${{ jobs.macos.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Controller tests (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - name: Build MCP bridge
+        run: bun build src/mcp.ts --target=bun --outfile=dist/woodshed-mcp.js
+      - name: Exercise HTTP API and MCP against the demo controller
+        run: |
+          bun scripts/verify-crit-http.ts
+          bun scripts/smoke-mcp.ts
+
+  macos:
+    name: Native Mac build and interaction
+    runs-on: macos-15
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - id: identity
+        run: echo "version=$(bun scripts/release-version.ts)" >> "$GITHUB_OUTPUT"
+      - name: Build versioned Apple Silicon app
+        env:
+          WOODSHED_VERSION: ${{ steps.identity.outputs.version }}
+          WOODSHED_BUILD: ${{ github.run_number }}
+        run: sh scripts/build-mac.sh
+      - name: Check native state transitions with a mock controller
+        run: sh scripts/check-native-interaction.sh
+      - name: Archive app bundle
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Woodshed.app dist/Woodshed-macos-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-app
+          path: dist/Woodshed-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 7

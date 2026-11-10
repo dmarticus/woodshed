@@ -7,6 +7,7 @@
     "start": "bun src/server.ts",
     "demo": "WOODSHED_DEMO=1 bun src/server.ts",
     "test": "bun test",
+    "typecheck": "tsc --noEmit --module preserve --moduleResolution bundler --target esnext --types bun --skipLibCheck src/*.ts scripts/*.ts tests/*.ts",
     "mcp": "bun src/mcp.ts"
   },
   "dependencies": {

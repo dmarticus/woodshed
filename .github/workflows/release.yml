@@ -1,0 +1,125 @@
+name: Release and deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never interrupt a controller switch in progress. Pending pushes coalesce to the latest.
+concurrency:
+  group: woodshed-release
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    if: github.ref == 'refs/heads/master'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Publish GitHub release
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ needs.checks.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-app
+          path: dist
+      - name: Package controller and MCP bridge
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          bun scripts/package-release.ts "$VERSION" "$GITHUB_SHA" "$GITHUB_RUN_NUMBER"
+          bun build src/mcp.ts --target=bun --outfile=dist/woodshed-mcp.js
+          cd dist
+          sha256sum Woodshed-macos-arm64.zip Woodshed-server.tar.gz woodshed-mcp.js > SHA256SUMS
+      - name: Publish versioned assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          TAG="v$VERSION"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF_NOTES
+          Built and tested from commit $GITHUB_SHA.
+
+          - **Mac:** Download Woodshed-macos-arm64.zip (Apple Silicon, macOS 14+). Replace your existing app; controller connection settings stay in Application Support.
+          - **Server:** Woodshed-server.tar.gz contains the controller source and lockfile. The following deployment job updates the VM and verifies this exact commit.
+          - **MCP:** woodshed-mcp.js runs with Bun.
+          - SHA256SUMS contains checksums for all three assets.
+
+          The Mac app uses ad-hoc signing and is not notarized. This is a personal build; macOS may require explicit approval on first open. There is no in-app updater yet.
+          EOF_NOTES
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)" = "$GITHUB_SHA"
+            gh release upload "$TAG" dist/Woodshed-macos-arm64.zip dist/Woodshed-server.tar.gz dist/woodshed-mcp.js dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/Woodshed-macos-arm64.zip dist/Woodshed-server.tar.gz dist/woodshed-mcp.js dist/SHA256SUMS --target "$GITHUB_SHA" --title "Woodshed $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" --draft
+          fi
+          gh release edit "$TAG" --draft=false --latest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            dist/Woodshed-server.tar.gz
+            dist/SHA256SUMS
+          retention-days: 7
+
+  deploy:
+    name: Deploy controller to VM
+    needs: release
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+      - name: Configure deployment SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.WOODSHED_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.WOODSHED_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/woodshed_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/woodshed_deploy ~/.ssh/known_hosts
+      - name: Upload and deploy tested controller
+        env:
+          DEPLOY_HOST: ${{ vars.WOODSHED_HOST }}
+          DEPLOY_USER: ${{ vars.WOODSHED_USER }}
+        run: |
+          cd release
+          sha256sum --check --ignore-missing SHA256SUMS
+          TARGET="$DEPLOY_USER@$DEPLOY_HOST"
+          RELEASE_ID="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          ssh -i ~/.ssh/woodshed_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "$TARGET" "mkdir -p ~/woodshed-releases/$RELEASE_ID"
+          scp -i ~/.ssh/woodshed_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes Woodshed-server.tar.gz "$TARGET:woodshed-releases/$RELEASE_ID/release.tar.gz"
+          ssh -i ~/.ssh/woodshed_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "$TARGET" bash -s -- "$RELEASE_ID" "$GITHUB_SHA" <<'REMOTE'
+          set -euo pipefail
+          export PATH="$HOME/.bun/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          next="$HOME/woodshed-releases/$1"
+          tar -xzf "$next/release.tar.gz" -C "$next"
+          rm "$next/release.tar.gz"
+          cd "$next"
+          bun install --frozen-lockfile
+          umask 077
+          flock "$HOME/.config/woodshed/deploy.lock" bun scripts/deploy-release.ts "$next" "$2"
+          REMOTE

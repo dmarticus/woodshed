@@ -14,6 +14,7 @@ import { SharedCI } from "./ci-incidents";
 import { Playbooks } from "./playbooks";
 import type { Analytics } from "./analytics";
 import { ProductAnalytics, type ActionSource } from "./product-analytics";
+import { buildInfo } from "./build-info";
 
 export class Controller {
   syncing = false;
@@ -27,7 +28,7 @@ export class Controller {
   sleeping = false;
   health() {
     const records = this.store.all();
-    return { remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
+    return { build: buildInfo, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting").length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
   }
   power(event: "sleep" | "wake", confirmed = true): void {
     if (process.env.WOODSHED_REMOTE === "1" && confirmed) return;

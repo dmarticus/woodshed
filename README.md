@@ -186,6 +186,20 @@ The Mac app and MCP bridge read `~/Library/Application Support/Woodshed/controll
 
 After connecting, `bun scripts/smoke-mcp.ts --live` verifies tools, bounded waits, and resources through the configured controller connection. Restart existing MCP connections after cutover so they read the remote credential. To reconnect the tunnel automatically after Mac login, run the tunnel script from a user LaunchAgent with `RunAtLoad` and `KeepAlive`; the script handles reconnecting after SSH interruptions. Keep the VM's timezone consistent with the Mac's daily budget, and preserve existing daily usage when migrating a controller so cutover does not reset its spend allowance. Old agent sessions and run history remain on the original machine.
 
+## Releases and deployments
+
+Pull requests to `master` run Linux controller tests, TypeScript checking, demo HTTP/MCP smoke checks, and a Swift 6 Apple Silicon build with native interaction checks. These checks use invented fixtures and do not call models or modify live PRs.
+
+Every push to `master` runs those checks and then publishes a GitHub Release. Versions use the major/minor from `package.json` plus the release workflow run number, for example `v0.1.12`. Re-running a workflow keeps the same version and commit. Releases include the Mac app ZIP, a controller source archive with a frozen Bun lockfile, the MCP bundle, and SHA-256 checksums. The Mac app carries the release version and build number; the controller's authenticated `/health` endpoint reports its version and source commit.
+
+The release workflow then deploys the tested controller archive to the VM over SSH. It installs dependencies in a new immutable directory under `~/woodshed-releases`, temporarily changes Auto to Watch, and waits up to 20 minutes for attached jobs and polling to finish. If jobs remain attached (including blocked jobs), deployment fails while the existing version keeps running. Finish those jobs and re-run the workflow. A queued newer push replaces older pending releases; a deployment already running is allowed to finish.
+
+Before switching, deployment stops only the controller and takes a SQLite backup under `~/.config/woodshed/backups`. It atomically switches `~/woodshed-current`, starts the service, and checks that the running controller reports the exact release commit. A failed startup restores the previous directory and service. Auto resumes after success or rollback; a deliberate switch to Paused while draining is respected. Database, worktrees, transcripts, configuration, credentials, and daily spend persist across updates. Code rollback does not restore the database; future incompatible database migrations need an explicit migration and rollback plan. Old release directories and backups are retained.
+
+The existing VM uses a systemd unit pointing at `~/woodshed-current`, with `WOODSHED_CONFIG=/home/woodshed/repos/woodshed/woodshed.config.json`. Each release links its `.woodshed` directory and `.env.local` to the original persistent files. For another VM, provision the headless service and this layout first. GitHub Actions needs repository variables `WOODSHED_HOST` and `WOODSHED_USER`, secrets `WOODSHED_SSH_KEY` and `WOODSHED_SSH_KNOWN_HOSTS`, and a `production` environment. The dedicated deployment key belongs to the non-root service user, and its host key is pinned. Never upload controller or model credentials to Actions.
+
+Download the Mac ZIP from [GitHub Releases](https://github.com/dmarticus/woodshed/releases), unzip it, and replace the installed app. Existing controller connection settings stay in Application Support. These personal builds use ad-hoc signing and are not notarized; macOS may require explicit approval on first launch. Mac updates and replacement of a local MCP bundle are manual; deploying the VM does not replace either local binary. There is no in-app updater yet.
+
 ## Check
 
 ```sh
