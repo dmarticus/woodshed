@@ -147,8 +147,9 @@ struct InteractionSmoke {
         data["mode"] = "paused"; model.state = try decode()
         precondition(model.queued.contains { $0.id == 206 } && model.running.contains { $0.id == 212 }, "Global pause keeps live work and queued work distinct from individually paused PRs")
         precondition(model.listStatus(model.selected!)?.hasPrefix("New work is paused") == true)
-        print("PASS: disjoint PR sections, exact waiting reasons, paused/skipped PRs, completed runs, readiness expiry, Watch mode and paused queues")
+        report("PASS: disjoint PR sections, exact waiting reasons, paused/skipped PRs, completed runs, readiness expiry, Watch mode and paused queues")
     }
+    static func report(_ message: String) { print(message); fflush(nil) }
     static func main() async throws {
         _ = NSApplication.shared
         let args = CommandLine.arguments
@@ -201,7 +202,7 @@ struct InteractionSmoke {
         model.selectedNumber = 105
         precondition(model.error(for: model.selected!)?.contains("changed") == true)
         precondition(model.pendingActions.isEmpty && model.executingAction == nil)
-        print("PASS: stable title, independent checkboxes, section changes, queued actions, navigation and scoped failures")
+        report("PASS: stable title, independent checkboxes, section changes, queued actions, navigation and scoped failures")
 
         DelayedController.server.lock.withLock { DelayedController.server.failSettings = true }
         model.setMode(.watch)
@@ -212,7 +213,7 @@ struct InteractionSmoke {
         model.setMode(.watch)
         try await until { model.pendingMode == nil }
         precondition(model.mode == .watch, "Successful saves must confirm the requested mode")
-        print("PASS: immediate mode feedback, failure rollback and successful confirmation")
+        report("PASS: immediate mode feedback, failure rollback and successful confirmation")
 
         window.contentView = nil
         model.selectedNumber = nil
@@ -227,7 +228,7 @@ struct InteractionSmoke {
         await model.loadAgent()
         await oldOutput.value
         precondition(model.agent?.name == "ws-106-preview" && model.agent?.output == "current output", "A late response must not overwrite the current output after navigating away and back")
-        print("PASS: stale agent responses cannot overwrite newer output")
+        report("PASS: stale agent responses cannot overwrite newer output")
 
         model.selectedNumber = 105
         model.drafts[105] = "First answer"
@@ -241,7 +242,7 @@ struct InteractionSmoke {
         precondition(restored.drafts[105] == model.drafts[105], "Unsent drafts must survive relaunch")
         let sentAgain = await model.sendDraft(other, isReply: true)
         precondition(sentAgain && model.drafts[105] == nil, "Clear only the exact draft acknowledged by the controller")
-        print("PASS: reply drafts survive navigation and relaunch; late acknowledgements preserve edits")
+        report("PASS: reply drafts survive navigation and relaunch; late acknowledgements preserve edits")
         DelayedController.server.lock.withLock {
             var records = DelayedController.server.state["prs"] as! [[String: Any]]
             let index = records.firstIndex { ($0["snapshot"] as! [String: Any])["number"] as? Int == 104 }!
@@ -264,7 +265,7 @@ struct InteractionSmoke {
         model.selectedNumber = 104
         precondition(approvalSent && model.selected?.approval?.status == "requested")
         precondition(!model.canRequestApproval(model.selected!), "Requested must stay distinct from approval and prevent duplicate submissions")
-        print("PASS: Stamphog requests show local progress, preserve navigation, and become requested after acknowledgement")
+        report("PASS: Stamphog requests show local progress, preserve navigation, and become requested after acknowledgement")
         window.close()
 
         let dockModel = InboxModel(previewState: model.state!)
@@ -288,6 +289,6 @@ struct InteractionSmoke {
         precondition(NSApp.windows.filter { $0.identifier?.rawValue == "woodshed-main" && $0.isVisible }.count == 1, "Repeated Dock clicks must not duplicate the window")
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
         mainWindow.close()
-        print("PASS: Dock launch, reopen after close, minimized-window restoration and single-window state preservation")
+        report("PASS: Dock launch, reopen after close, minimized-window restoration and single-window state preservation")
     }
 }

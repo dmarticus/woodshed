@@ -8,4 +8,13 @@ cat > .woodshed/InteractionSmoke.app/Contents/Info.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>InteractionSmoke</string><key>CFBundleIdentifier</key><string>dev.woodshed.interaction-smoke</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>
 PLIST
 codesign --force --sign - .woodshed/InteractionSmoke.app
-.woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json
+if .woodshed/InteractionSmoke.app/Contents/MacOS/InteractionSmoke .woodshed/native-interaction.json; then
+  exit 0
+else
+  status=$?
+  sleep 2
+  for report in "$HOME"/Library/Logs/DiagnosticReports/InteractionSmoke*.ips; do
+    if [ -f "$report" ]; then cat "$report"; fi
+  done
+  exit "$status"
+fi
