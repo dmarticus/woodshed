@@ -7,6 +7,17 @@ final class MockController: @unchecked Sendable {
     var failSettings = false
     var agentLoads: [Int: Int] = [:]
     var actionStarts: [(String, Date)] = []
+    private let responseGate = NSCondition()
+    private var allowedResponses: Set<String> = []
+    func waitForResponse(_ path: String) {
+        guard path.hasSuffix("/mark-ready") || path.hasSuffix("/request-approval") else { return }
+        responseGate.lock(); defer { responseGate.unlock() }
+        while !allowedResponses.contains(path) { responseGate.wait() }
+    }
+    func allowResponse(_ path: String) {
+        responseGate.lock(); defer { responseGate.unlock() }
+        allowedResponses.insert(path); responseGate.broadcast()
+    }
     func response(_ request: URLRequest) -> (Data, Int, Double) {
         lock.withLock {
             let path = request.url!.path
@@ -70,6 +81,7 @@ final class DelayedController: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let (payload, status, delay) = Self.server.response(request)
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [self] in
+            Self.server.waitForResponse(request.url!.path)
             guard !lock.withLock({ cancelled }) else { return }
             if request.url?.path.hasSuffix("mark-ready") == true { Self.server.promote() }
             if request.url?.path.hasSuffix("request-approval") == true { Self.server.approvalRequested() }
@@ -203,9 +215,11 @@ struct InteractionSmoke {
         try await until { model.pendingActions[105] != nil }
         precondition(model.progressLabel(105)?.hasPrefix("Queued") == true, "Queued actions must not claim to have reached GitHub")
         model.selectedNumber = 104
-        let start = Date()
+        // Hold the HTTP response until navigation and queued actions have been
+        // exercised. Shared CI runner speed must not decide whether I/O finished.
         for _ in 0..<20 { try await Task.sleep(for: .milliseconds(10)) }
-        precondition(Date().timeIntervalSince(start) < 0.6 && model.pendingActions[104] != nil, "The main actor must stay responsive during the slow request")
+        precondition(model.pendingActions[104] != nil && model.selectedNumber == 104, "Navigation and progress must work before the HTTP response arrives")
+        DelayedController.server.allowResponse("/api/prs/104/mark-ready")
         let success = await action.value
         precondition(success && model.selectedNumber == 104 && model.selected?.snapshot.draft == false, "Moving sections must preserve the selected PR")
         model.selectedNumber = 106
@@ -273,6 +287,7 @@ struct InteractionSmoke {
         precondition(model.canAct(on: model.selected!), "Other PRs remain actionable during an approval request")
         try await Task.sleep(for: .milliseconds(100))
         precondition(model.pendingActions[104] == "request-approval")
+        DelayedController.server.allowResponse("/api/prs/104/request-approval")
         let approvalSent = await approval.value
         model.selectedNumber = 104
         precondition(approvalSent && model.selected?.approval?.status == "requested")
