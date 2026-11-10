@@ -11,6 +11,7 @@ export type Snapshot = {
 export type Decision = {
   kind: "paused" | "waiting" | "fix" | "review" | "approval" | "human" | "ready" | "closed";
   reason: string;
+  response?: "reply" | "retry" | "recheck";
   action?: { label: string; url: string };
   title?: string;
   question?: string;
@@ -19,8 +20,8 @@ export type Decision = {
 };
 export type Job = { name: string; head: string; fingerprint: string; startedAt: string; kind?: "repair" | "branch-update" | "triage"; instructions?: string; afterTurn?: number; model?: string; budgetUSD?: number; adapter?: "app-server"; budgetOverride?: boolean; manual?: boolean; freshCheckout?: boolean; handoff?: import("./handoff").Handoff; repairHints?: import("./playbooks").RepairHint[]; playbooksApplied?: string[] };
 export type ReviewThreadAssessment = { id: string; status: "addressed" | "needs_repair" | "awaiting_reviewer"; reason: string; code_url?: string };
-export type AssessmentResult = { head: string; route: "wait" | "repair" | "ask" | "ready"; category: "review" | "checks" | "visual" | "product" | "operations" | "internal"; title: string; reason: string; question?: string; options?: { id: string; label: string; value: string }[]; instructions?: string; action?: { label: string; url: string }; evidence: { url: string; detail: string }[]; review_threads?: ReviewThreadAssessment[] };
-export type Assessment = { id?: string; head: string; key: string; report: string; sourceJob?: Job; attempts: number; result?: AssessmentResult; reply?: string; followups: number; jevChecked?: boolean; allowWatch?: boolean };
+export type AssessmentResult = { head: string; route: "wait" | "repair" | "ask" | "ready"; category: "review" | "checks" | "visual" | "product" | "operations" | "internal"; response?: "reply" | "recheck"; title: string; reason: string; question?: string; options?: { id: string; label: string; value: string }[]; instructions?: string; action?: { label: string; url: string }; evidence: { url: string; detail: string }[]; review_threads?: ReviewThreadAssessment[] };
+export type Assessment = { id?: string; head: string; key: string; report: string; sourceJob?: Job; attempts: number; result?: AssessmentResult; reply?: string; followups: number; jevChecked?: boolean; allowWatch?: boolean; attentionVersion?: number };
 export type Record = {
   snapshot: Snapshot; decision: Decision; paused: boolean; attempts: number;
   fingerprint: string; job?: Job; lastError?: string;

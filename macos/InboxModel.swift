@@ -164,6 +164,10 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         }) { return "Reconnect GitHub to continue monitoring and repairs." }
         return nil
     }
+    func needsAnswer(_ record: PullRequestRecord) -> Bool {
+        if let response = record.decision.response { return response == "reply" }
+        return record.assessment?.result?.route == "ask" || record.job != nil && lastRun(record)?.prompt?.kind == "question"
+    }
     var notificationBroken: Bool { notificationPermission == "denied" && (notifyNeeds || notifyReady || notifyFinished) }
     var attentionCount: Int { attention.count + (notificationBroken ? 1 : 0) }
     var status: String {
@@ -602,8 +606,8 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
             let version = "\(record.snapshot.head):\(record.decision.kind):\(record.decision.id ?? record.decision.reason)"
             let key = String(record.id)
             guard seen[key] != version else { continue }
-            let category = record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : record.decision.question != nil || run?.prompt?.kind == "question" ? "question" : "attention"
-            await deliver(record, title: record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.decision.reason, category: category, identifier: "pr-\(key)")
+            let category = record.decision.kind == "ready" ? "ready" : run?.state == "budget" || record.decision.reason.lowercased().contains("spend") ? "budget" : (record.decision.response == "reply" || record.decision.response == nil && record.decision.question != nil || run?.prompt?.kind == "question") ? "question" : "attention"
+            await deliver(record, title: record.decision.kind == "ready" ? "Ready to merge" : record.decision.title ?? "Woodshed needs you", text: record.decision.question ?? record.decision.reason, category: category, identifier: "pr-\(key)")
             seen[key] = version
         }
         let completed = allRuns.filter { $0.endedAt != nil }

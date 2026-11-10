@@ -176,6 +176,7 @@ struct PullRequestRecord: Decodable, Identifiable, Sendable {
         struct Option: Decodable, Identifiable, Sendable { let id: String; let label: String; let value: String }
         let id: String?
         let questionKey: String?
+        let response: String?
         let options: [Option]?
         let kind: String
         let reason: String
@@ -184,6 +185,7 @@ struct PullRequestRecord: Decodable, Identifiable, Sendable {
         let question: String?
     }
     struct Assessment: Decodable, Sendable {
+        let report: String?
         struct Result: Decodable, Sendable {
             struct Evidence: Decodable, Sendable { let url: String; let detail: String }
             let route: String
@@ -237,6 +239,10 @@ struct PullRequestRecord: Decodable, Identifiable, Sendable {
         case "paused": return "Paused"
         default: return decision.reason
         }
+    }
+    var checksLabel: String {
+        if snapshot.checks.contains(where: { $0.failed || $0.pending }) || snapshot.checks.isEmpty { return checksSummary }
+        return snapshot.checks.contains(where: { $0.conclusion == "SUCCESS" }) ? "Checks passed" : "Checks complete"
     }
     var checksSummary: String {
         let failed = snapshot.checks.filter(\.failed).count

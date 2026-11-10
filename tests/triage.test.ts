@@ -3,6 +3,7 @@ import { Controller } from "../src/controller";
 import { Store } from "../src/store";
 import { decide, fingerprint, type AssessmentResult, type Config, type Snapshot } from "../src/model";
 import { assessmentKey, parseAssessment } from "../src/triage";
+import { localDay } from "../src/usage";
 import { checkWithJev } from "../src/jev";
 
 const pr = (): Snapshot => ({ number: 42, title: "Fix export", url: "https://github.com/example/project/pull/42", head: "abc", branch: "feature", base: "main", state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: [{ name: "Tests", status: "COMPLETED", conclusion: "SUCCESS", url: "" }], threads: [], labels: [], reviews: [{ author: "reviewer", state: "APPROVED", body: "Reviewed", head: "abc", submittedAt: "" }] });
@@ -120,7 +121,7 @@ test("an exhausted substantive repair names the remaining finding without overwr
   record.snapshot.threads = [{ id: "thread", comments: [{ author: "reviewer", body: "Handle the missing value", url: link }] }]; record.humanHead = undefined;
   record.assessment = { head: "abc", key: assessmentKey(record.snapshot), report: "Repair remains", attempts: 1, followups: 2, result: { ...answer("wait"), category: "review", review_threads: [{ id: "thread", status: "needs_repair", reason: "The empty-value fallback still returns an invalid URL." }] } };
   h.store.put(record); await h.controller.reconcile(record.snapshot);
-  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "Review the remaining repair", action: { url: link } });
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "Review feedback still needs a fix", response: "retry", action: { url: link } });
   expect(h.store.get(42)?.decision.reason).toContain("empty-value fallback");
   expect(h.store.get(42)?.assessment?.result?.route).toBe("wait");
 });
@@ -211,4 +212,44 @@ test("optional Jev routing uses typed choices, validates responses, and makes no
   expect(await checkWithJev(pr(), answer(), "", request)).toBeUndefined(); expect(requests).toBe(0);
   expect(await checkWithJev(pr(), answer(), "fixture-key", request)).toMatchObject({ choice: "ask", inputTokens: 500 });
   await expect(checkWithJev(pr(), answer(), "fixture-key", (async () => Response.json({ answers: { route: { choice: "invented" } } })) as any)).rejects.toThrow("Invalid TypeSafe");
+});
+
+
+test("a requested reviewer cannot hide failing CI in a review-wait result", () => {
+  const checks = [{ ...pr().checks[0], conclusion: "FAILURE" }];
+  const result = { ...answer("wait"), category: "review" as const };
+  expect(() => parseAssessment(result, "abc", [], "example/project", checks)).toThrow("does not explain failing CI");
+  expect(parseAssessment({ ...result, category: "checks" }, "abc", [], "example/project", checks).route).toBe("wait");
+});
+
+test("missing CI-provider access remains an explicit owner action despite requested reviews", async () => {
+  const h = harness(); const record = h.store.get(42)!;
+  record.snapshot.reviewRequests = ["Team Review"]; record.snapshot.checks[0].conclusion = "FAILURE";
+  record.humanHead = undefined;
+  record.assessment = { head: "abc", key: assessmentKey(record.snapshot), report: "CI provider access is missing", attempts: 1, followups: 2, result: { ...answer(), category: "operations", response: "recheck", title: "Connect Depot on the maintenance server", reason: "Woodshed cannot retry the failed checks without Depot access.", question: "Sign in to Depot on the server, or retry the failed jobs in Depot. Then recheck this PR.", action: { label: "Open failed job", url: "https://depot.dev/job/example" } } };
+  h.store.put(record); await h.controller.reconcile(record.snapshot);
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", response: "recheck", title: "Connect Depot on the maintenance server", action: { url: "https://depot.dev/job/example" } });
+  expect(h.store.get(42)?.decision.question).not.toContain("Team Review");
+  expect(h.launches()).toBe(0); expect(h.store.get(42)?.assessment?.followups).toBe(2);
+});
+
+test("legacy mixed review/CI escalation gets one bounded investigation without restarting repair or resetting spend", async () => {
+  const h = harness(); const record = h.store.get(42)!;
+  record.snapshot.checks[0].conclusion = "FAILURE"; record.humanHead = undefined;
+  h.store.saveRun({ id: "previous-repair", number: 42, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), state: "stopped", model: "fixture", turns: 2, costUSD: 0.4, costsByDay: { [localDay()]: 0.4 }, summary: "Saved repair" });
+  record.assessment = { head: "abc", key: assessmentKey(record.snapshot), report: "Depot token missing; cannot retry", attempts: 1, followups: 2, result: { ...answer("wait"), category: "review" } };
+  h.store.put(record);
+  await h.controller.reconcile(record.snapshot);
+  expect(h.store.get(42)?.assessment).toMatchObject({ followups: 2, attentionVersion: 1 });
+  expect(h.launches()).toBe(1);
+  h.outcome({ state: "triaged", assessment: { ...answer("wait"), category: "review" } });
+  await h.controller.reconcile(record.snapshot);
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "CI still needs a fix", response: "retry" });
+  expect(h.launches()).toBe(1); expect(h.store.spend(20).spentUSD).toBeGreaterThanOrEqual(0.4);
+  await h.controller.reconcile(record.snapshot); expect(h.launches()).toBe(1);
+});
+
+test("owner response is validated and preserved for an external prerequisite", () => {
+  expect(parseAssessment({ ...answer(), response: "recheck" }, "abc").response).toBe("recheck");
+  expect(() => parseAssessment({ ...answer(), response: "retry" }, "abc")).toThrow("response type");
 });

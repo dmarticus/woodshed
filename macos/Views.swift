@@ -292,6 +292,7 @@ struct PRDetailView: View {
     @State private var reviewer = ""
     @State private var requestingReviewer = false
     @FocusState private var answerFocused: Bool
+    @State private var composerNumber: Int?
     init(model: InboxModel, initialTab: String = "agent") { self.model = model; _showChecks = State(initialValue: initialTab == "checks"); _showReview = State(initialValue: initialTab == "review") }
     var body: some View {
         if let record = model.selected {
@@ -314,7 +315,7 @@ struct PRDetailView: View {
                         }.padding(14).background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                     }
                     primaryActions(record)
-                    ApprovalRequestView(record: record, model: model)
+                    if record.decision.kind != "human" { ApprovalRequestView(record: record, model: model) }
                     if record.decision.kind == "ready", let report = record.readiness {
                         Fold("Readiness report") {
                             VStack(alignment: .leading, spacing: 7) {
@@ -326,30 +327,57 @@ struct PRDetailView: View {
                             }
                         }
                     }
-                    if let evidence = record.assessment?.result?.evidence, !evidence.isEmpty {
-                        Fold("What Woodshed checked") { VStack(alignment: .leading, spacing: 8) { ForEach(Array(evidence.enumerated()), id: \.offset) { _, item in Button(item.detail) { model.openExternal(item.url) }.buttonStyle(.link).font(.callout) } } }
-                    }
                     if requestingReviewer { HStack { TextField("GitHub username or organization/team", text: $reviewer).textFieldStyle(.roundedBorder); Button("Request review") { Task { if await model.act("reviewer", on: record, reviewer: reviewer) { reviewer = ""; requestingReviewer = false } } }.disabled(!model.canAct(on: record) || reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
                     if showChecks { CheckSummaryView(record: record, model: model) }
                     if showReview { ReviewThreadsView(record: record, model: model) }
-                    if let run = model.lastRun(record) { Divider(); RunCard(run: run, record: record, model: model).id(run.id) }
-                    else if record.decision.kind == "ready" { Text("No agent repair was needed for this PR.").font(.callout).foregroundStyle(.secondary) }
-                    else if !record.isWatched { Text("This PR isn’t watched. Watch it again to include it in Woodshed.").font(.callout).foregroundStyle(.secondary) }
-                    else if model.section(for: record) == .paused || model.mode == .paused { Text(model.section(for: record) == .paused ? record.decision.reason : "New work is paused. Resume when you’re ready to continue.").font(.callout).foregroundStyle(.secondary) }
-                    if !record.snapshot.draft && record.isWatched && !record.paused && model.mode != .paused && record.job?.kind != "triage" && record.decision.kind != "ready" && record.recovery?.retryAt == nil { RunComposer(record: record, model: model, focus: $answerFocused) }
-                    let older = model.runs(record).filter { $0.id != model.lastRun(record)?.id }
-                    if !older.isEmpty { Fold("\(older.count) earlier run\(older.count == 1 ? "" : "s")") { RunHistoryView(runs: older, model: model, showPR: false) } }
+                    if canCompose(record) {
+                        if composerNumber == record.id || model.needsAnswer(record) && (record.decision.options?.isEmpty ?? true) || model.lastRun(record)?.prompt?.kind == "question" {
+                            RunComposer(record: record, model: model, focus: $answerFocused)
+                        } else if record.decision.kind != "human" {
+                            Button("Give Woodshed instructions…") { openComposer(record) }.buttonStyle(.link).font(.callout)
+                        }
+                    }
+                    if let run = model.lastRun(record), run.live { RunCard(run: run, record: record, model: model).id(run.id) }
+                    if record.assessment?.report != nil || record.assessment?.result?.evidence.isEmpty == false || record.decision.kind == "human" && record.approval?.status == "approved" {
+                        Fold("Investigation details") {
+                            VStack(alignment: .leading, spacing: 12) {
+                                if let report = record.assessment?.report, !report.isEmpty {
+                                    Text("What the repair reported").font(.callout.weight(.medium))
+                                    FeedbackText(text: report).font(.callout).foregroundStyle(.secondary)
+                                }
+                                ForEach(Array((record.assessment?.result?.evidence ?? []).enumerated()), id: \.offset) { _, item in
+                                    Button(item.detail) { model.openExternal(item.url) }.buttonStyle(.link).font(.callout).multilineTextAlignment(.leading)
+                                }
+                                if record.decision.kind == "human" { ApprovalRequestView(record: record, model: model) }
+                            }
+                        }
+                    }
+                    let completed = model.runs(record).filter { !$0.live }
+                    if !completed.isEmpty {
+                        Fold("Run history (\(completed.count))") { RunHistoryView(runs: completed, model: model, showPR: false) }
+                    }
                 }.frame(maxWidth: 900, alignment: .topLeading).padding(24).frame(maxWidth: .infinity, alignment: .topLeading)
             }.frame(minWidth: 410, minHeight: 440).background(Color(nsColor: .windowBackgroundColor))
                 .task(id: record.job?.name) {
                     await model.loadAgent()
                     if model.startTaskNumber == record.id {
                         await Task.yield()
+                        composerNumber = record.id
                         answerFocused = true
                         model.startTaskNumber = nil
                     }
                 }
+                .onChange(of: model.startTaskNumber) { _, number in
+                    if number == record.id { openComposer(record); model.startTaskNumber = nil }
+                }
         } else { ContentUnavailableView("Choose a PR", systemImage: "hammer", description: Text("Your runs and decisions appear here.")) }
+    }
+    private func canCompose(_ record: PullRequestRecord) -> Bool {
+        !record.snapshot.draft && record.isWatched && !record.paused && model.mode != .paused && record.job?.kind != "triage" && record.decision.kind != "ready" && record.recovery?.retryAt == nil
+    }
+    private func openComposer(_ record: PullRequestRecord) {
+        composerNumber = record.id
+        Task { await Task.yield(); answerFocused = true }
     }
     private func header(_ record: PullRequestRecord) -> some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -382,14 +410,14 @@ struct PRDetailView: View {
             }
             HStack(spacing: 20) {
                 Button { showChecks.toggle() } label: {
-                    Label(record.checksSummary, systemImage: record.snapshot.checks.contains { $0.failed } ? "exclamationmark.circle" : "checkmark.circle")
+                    Label(record.checksLabel, systemImage: record.snapshot.checks.contains { $0.failed } ? "exclamationmark.circle" : "checkmark.circle")
                         .foregroundStyle(record.snapshot.checks.contains { $0.failed } ? Color.orange : Color.secondary)
                     Image(systemName: showChecks ? "chevron.up" : "chevron.down").font(.caption2)
                 }.buttonStyle(.borderless).accessibilityValue(showChecks ? "Expanded" : "Collapsed")
-                Button { showReview.toggle() } label: {
+                if !record.snapshot.threads.isEmpty || showReview { Button { showReview.toggle() } label: {
                     Label("\(record.snapshot.threads.count) open thread\(record.snapshot.threads.count == 1 ? "" : "s")", systemImage: "bubble.left")
                     Image(systemName: showReview ? "chevron.up" : "chevron.down").font(.caption2)
-                }.buttonStyle(.borderless).foregroundStyle(.secondary).accessibilityValue(showReview ? "Expanded" : "Collapsed")
+                }.buttonStyle(.borderless).foregroundStyle(.secondary).accessibilityValue(showReview ? "Expanded" : "Collapsed") }
             }.font(.callout)
         }.animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.pendingActions[record.id])
     }
@@ -422,9 +450,9 @@ struct PRDetailView: View {
             else { Button("Merge on GitHub") { model.track("merge_on_github", number: record.id); model.openGitHub(record.snapshot.url) }.buttonStyle(.borderedProminent) }
         } else if record.decision.kind == "human" {
             VStack(alignment: .leading, spacing: 10) {
-                Text(record.decision.title ?? "Your next step").font(.headline)
-                FeedbackText(text: record.decision.reason).font(.callout)
-                if let question = record.decision.question { Text(question).font(.callout.weight(.medium)).textSelection(.enabled) }
+                Text(record.decision.title ?? (model.needsAnswer(record) ? "Answer this question" : "The repair needs your help")).font(.headline)
+                if let question = record.decision.question, question != record.decision.reason, !question.contains(record.decision.reason) { FeedbackText(text: record.decision.reason).font(.callout).foregroundStyle(.secondary) }
+                Text(record.decision.question ?? record.decision.reason).font(.body).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                 if record.recovery != nil && record.decision.title == "Retry recovery" {
                     Button("Retry recovery") { Task { await model.recheck(record) } }.buttonStyle(.borderedProminent).disabled(!model.canAct(on: record))
                 } else if model.lastRun(record)?.state == "budget" || record.decision.reason.localizedCaseInsensitiveContains("spend") || record.decision.title?.localizedCaseInsensitiveContains("budget") == true {
@@ -434,13 +462,19 @@ struct PRDetailView: View {
                         Button("Stop run") { Task { await model.act("stop", on: record) } }.disabled(!model.canAct(on: record))
                     }
                     Text("The daily cap stays unchanged.").font(.caption).foregroundStyle(.secondary)
-                } else if model.lastRun(record)?.prompt?.kind == "permission" || record.decision.reason.localizedCaseInsensitiveContains("authentication") || record.decision.reason.localizedCaseInsensitiveContains("credential") {
-                    Button("Reconnect GitHub") { model.reconnectGitHub() }.buttonStyle(.borderedProminent).disabled(model.preview)
-                } else if let options = record.decision.options, !options.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) { ForEach(options) { option in Button(option.label) { Task { await model.act("reply", on: record, message: option.value) } }.buttonStyle(.bordered).disabled(!model.canAct(on: record)) } }
-                    Button("Something else…") { answerFocused = true }.buttonStyle(.link)
-                } else if record.decision.action == nil { Button("Answer question") { answerFocused = true }.buttonStyle(.borderedProminent) }
-                if let action = record.decision.action { Button(action.label) { model.openExternal(action.url) }.buttonStyle(.link) }
+                } else {
+                    if let action = record.decision.action {
+                        Button(action.label) { model.openExternal(action.url) }.buttonStyle(.borderedProminent)
+                    }
+                    if let options = record.decision.options, !options.isEmpty {
+                        ForEach(options) { option in Button(option.label) { Task { await model.act("reply", on: record, message: option.value) } }.buttonStyle(.bordered).disabled(!model.canAct(on: record)) }
+                        Button("Write a different answer…") { openComposer(record) }.buttonStyle(.link)
+                    } else if record.decision.response == "recheck" {
+                        Button("Recheck PR") { Task { await model.recheck(record) } }.buttonStyle(.bordered).disabled(!model.canAct(on: record))
+                    } else if !model.needsAnswer(record) && model.lastRun(record)?.prompt?.kind != "question" {
+                        Button("Retry with instructions…") { openComposer(record) }.buttonStyle(.bordered).disabled(!model.canAct(on: record))
+                    }
+                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(14).background(.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
         }
     }
@@ -546,20 +580,20 @@ struct RunComposer: View {
     var focus: FocusState<Bool>.Binding
     @State private var selectedModel = ""
     private var draft: Binding<String> { Binding(get: { model.drafts[record.id] ?? "" }, set: { model.drafts[record.id] = $0 }) }
-    private var isReply: Bool { record.assessment?.result?.route == "ask" || record.job != nil && model.lastRun(record)?.prompt?.kind == "question" }
+    private var isReply: Bool { model.needsAnswer(record) }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ZStack(alignment: .topLeading) {
-                if draft.wrappedValue.isEmpty { Text(isReply ? "Your answer to the agent" : "Tell the agent what to do next").font(.body).foregroundStyle(.tertiary).padding(.leading, 5).allowsHitTesting(false) }
+                if draft.wrappedValue.isEmpty { Text(isReply ? "Your answer to the agent" : "Tell the agent what to do next").font(.body).foregroundStyle(.secondary).padding(.leading, 5).allowsHitTesting(false) }
                 TextEditor(text: draft).focused(focus).scrollContentBackground(.hidden).frame(height: 76).font(.body).accessibilityLabel(isReply ? "Your answer" : "Run instructions")
             }
             HStack {
-                if !isReply { Text("Model:").foregroundStyle(.secondary); Picker("Model", selection: $selectedModel) { Text("Default · " + model.defaultModelName).tag(""); ForEach((model.state?.models ?? []).filter { $0.id != model.state?.settings?.defaultModel }) { Text($0.name).tag($0.id) } }.labelsHidden().pickerStyle(.menu).fixedSize() }
+                if !isReply { Menu("Run options") { Picker("Model", selection: $selectedModel) { Text("Default · " + model.defaultModelName).tag(""); ForEach((model.state?.models ?? []).filter { $0.id != model.state?.settings?.defaultModel }) { Text($0.name).tag($0.id) } }.pickerStyle(.inline) }.menuStyle(.borderlessButton).fixedSize() }
                 Spacer()
                 if model.actionPending { ProgressView().controlSize(.small) }
-                Button(isReply ? "Send reply" : record.job == nil ? "Start run" : "Restart with these instructions") {
+                Button(isReply ? "Send reply" : record.decision.response == "retry" ? "Retry repair" : record.job == nil ? "Start repair" : "Restart with these instructions") {
                     Task { await model.sendDraft(record, isReply: isReply, model: selectedModel) }
-                }.disabled(!model.canAct(on: record) || isReply && draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isReply && record.job != nil && draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }.disabled(!model.canAct(on: record) || isReply && draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isReply && (record.job != nil || record.decision.response == "retry") && draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }.font(.callout)
             if record.pendingReply != nil { Text("Your reply is queued until a run slot is available.").font(.caption).foregroundStyle(.secondary) }
         }.padding(12).overlay(RoundedRectangle(cornerRadius: 9).stroke(.secondary.opacity(0.4)))

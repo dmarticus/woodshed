@@ -170,7 +170,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       }
       if (run.status !== "done") return { state: "human", reason: run.summary };
       try {
-        const assessment = parseAssessment(await Bun.file(await this.resultPath(job)).json(), job.head, current?.head === job.head ? current.threads : undefined, this.config.repository);
+        const assessment = parseAssessment(await Bun.file(await this.resultPath(job)).json(), job.head, current?.head === job.head ? current.threads : undefined, this.config.repository, current?.head === job.head ? current.checks : undefined);
         await this.stop(job);
         return { state: "triaged", assessment };
       } catch (error) { return { state: "human", reason: String(error) }; }

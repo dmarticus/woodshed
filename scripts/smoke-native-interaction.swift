@@ -147,6 +147,18 @@ struct InteractionSmoke {
         data["mode"] = "paused"; model.state = try decode()
         precondition(model.queued.contains { $0.id == 206 } && model.running.contains { $0.id == 212 }, "Global pause keeps live work and queued work distinct from individually paused PRs")
         precondition(model.listStatus(model.selected!)?.hasPrefix("New work is paused") == true)
+        var attentionData = base
+        attentionData["decision"] = ["kind": "human", "reason": "Access is missing", "response": "recheck", "question": "Sign in to the CI provider and recheck"]
+        attentionData["assessment"] = ["result": ["route": "ask", "title": "Connect CI", "evidence": []]]
+        func attentionRecord() throws -> PullRequestRecord { try JSONDecoder().decode(PullRequestRecord.self, from: JSONSerialization.data(withJSONObject: attentionData)) }
+        let externalAction = try attentionRecord()
+        precondition(!model.needsAnswer(externalAction), "An external action must not offer a question reply")
+        attentionData["decision"] = ["kind": "human", "reason": "Choose an approach", "response": "reply"]
+        let productChoice = try attentionRecord()
+        precondition(model.needsAnswer(productChoice), "A product decision needs an answer")
+        attentionData["decision"] = ["kind": "human", "reason": "Repair stopped", "response": "retry"]
+        let stoppedRepair = try attentionRecord()
+        precondition(!model.needsAnswer(stoppedRepair), "Retry instructions must start a repair rather than answer a question")
         report("PASS: disjoint PR sections, exact waiting reasons, paused/skipped PRs, completed runs, readiness expiry, Watch mode and paused queues")
     }
     static func report(_ message: String) { print(message); fflush(nil) }

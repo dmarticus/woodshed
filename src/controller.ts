@@ -5,7 +5,7 @@ import { GitHub } from "./github";
 import { Runner } from "./runner";
 import { Store } from "./store";
 import { assessmentKey } from "./triage";
-import { bindDecision, sameQuestion } from "./decisions";
+import { bindDecision, sameQuestion, remainingRepairDecision } from "./decisions";
 import { checkWithJev } from "./jev";
 import { recoveryDelay, temporaryFailure, type Recovery } from "./recovery";
 import { handoffSchema, type Handoff } from "./handoff";
@@ -487,6 +487,11 @@ export class Controller {
     }
     const key = assessmentKey(pr);
     if (assessment.key !== key) { assessment.key = key; assessment.result = undefined; assessment.attempts = 0; }
+    // Older investigations hid failed CI behind a reviewer wait. Refresh that
+    // exhausted escalation once, retaining the repair limit and spend history.
+    if (!assessment.attentionVersion && assessment.followups >= 2 && assessment.result?.route === "wait" && assessment.result.category === "review" && pr.checks.some(failed)) {
+      assessment.attentionVersion = 1; assessment.result = undefined; assessment.attempts = 0;
+    }
     let result = assessment.result;
     if (result?.route === "wait" && result.category === "review") {
       const maintenance = decide(pr, { ...record, assessment: undefined, humanHead: undefined, job: undefined });
@@ -502,7 +507,7 @@ export class Controller {
     }
     if (result) {
       if (result.route === "ask") {
-        record.decision = { kind: "human", title: result.title, reason: result.reason, question: result.question, options: result.options, action: result.action };
+        record.decision = { kind: "human", title: result.title, reason: result.reason, question: result.question, response: result.response ?? "reply", options: result.options, action: result.action };
         return true;
       }
       if (result.route === "wait") {
@@ -536,11 +541,7 @@ export class Controller {
           } catch (error) { this.store.log(pr.number, `Saved conflict resolution did not qualify for bounded integration recovery: ${String(error)}`); }
         }
         if (assessment.followups >= 2) {
-          const remaining = decide(pr, { ...record, assessment: undefined, humanHead: undefined, job: undefined });
-          const finding = result.review_threads?.find(t => t.status === "needs_repair");
-          const detail = finding?.reason ?? result.reason;
-          const discussion = pr.threads.find(t => t.id === finding?.id) ?? pr.threads[0];
-          record.decision = { kind: "human", title: "Review the remaining repair", reason: `${remaining.reason}. ${detail}`, question: `Two follow-ups could not complete this repair. Review the remaining blocker and provide instructions: ${detail}`, action: { label: discussion ? "Review unresolved feedback" : "Open pull request", url: discussion?.comments[0]?.url ?? pr.url } };
+          record.decision = remainingRepairDecision(pr, result);
           return true;
         }
         record.decision = { kind: "waiting", reason: "Agent follow-up queued" };

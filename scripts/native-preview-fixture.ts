@@ -75,6 +75,16 @@ if (approvalPreview) {
     record.snapshot.reviewDecision = "APPROVED"; record.decision = { kind: "ready", reason: "Ready for your merge decision" };
   }
 }
+if (process.argv.includes("--needs-access") || process.argv.includes("--repair-stopped")) {
+  const record = prs[0]; record.snapshot.draft = false; delete record.job;
+  record.snapshot.title = "feat(signals): ask before implementing a claimed report";
+  record.snapshot.checks = [check("Backend tests on Depot", "FAILURE")];
+  record.snapshot.threads = [];
+  record.decision = process.argv.includes("--needs-access")
+    ? { kind: "human", response: "recheck", title: "Connect Depot on the maintenance server", reason: "Woodshed can't retry the failed checks without Depot access.", question: "Sign in to Depot on the server, or retry the failed jobs in Depot. Then recheck this PR.", action: { label: "Open failed job", url: "https://depot.dev/job/example" } }
+    : { kind: "human", response: "retry", title: "CI still needs a fix", reason: "Woodshed stopped after repeated attempts to finish this repair.", question: "Review what remains, then retry with instructions or finish the fix yourself.", action: { label: "Open failed check", url: "https://github.com/example/project/actions" } };
+  record.assessment = { report: "The CI provider reported a missing API token on the maintenance server. No retry was submitted.", result: { route: "ask", title: record.decision.title!, evidence: [{ url: "https://depot.dev/job/example", detail: "The CI job failed before the test runner started." }] } } as any;
+}
 const mode = approvalPreview ? "watch" : "auto";
 for (const record of prs) record.approval = approvalRequestState(record, true, mode);
 const quiet = process.argv.includes("--quiet");
