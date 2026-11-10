@@ -172,3 +172,22 @@ test("a head movement during the final GitHub preflight never posts a queue comm
   await expect(g.submitMergeQueue(healthy(), "11223344-1234-1234-1234-123456789abc")).rejects.toBeInstanceOf(QueueSubmissionRejected);
   expect(posts).toBe(0);
 });
+
+test("a failed batch optimization falls back to fresh individual PR reads", async () => {
+  const h = harness(); let reads = 0;
+  h.github.list = async () => [1]; h.github.prepareBatch = async () => { throw Error("GitHub HTTP 504"); };
+  h.github.snapshot = async () => { reads++; return healthy(); }; h.controller.error = "Previous refresh failed";
+  await h.controller.sync();
+  expect(reads).toBe(1); expect(h.controller.lastSync).not.toBeNull(); expect(h.controller.error).toBeNull();
+  expect(h.store.get(1)?.mergeQueue?.state).toBe("available");
+});
+
+test("app identity is read only for a matching queue check on its exact head", async () => {
+  const pr = healthy(); pr.checks.push({ name: "Trunk Merge Queue (main)", status: "COMPLETED", conclusion: "FAILURE", url });
+  const calls: string[][] = [];
+  const g = new GitHub({ repository: "example/project" } as Config, async args => {
+    calls.push(args); return JSON.stringify({ check_runs: [{ app: { slug: "trunk-io" }, head_sha: "head-1", name: "Trunk Merge Queue (main)", status: "completed", conclusion: "failure", details_url: url }] });
+  }); g.conditionalJSON = async () => [bot("<!-- Trunk Merge -->\nMerging to `main` in this repository is managed by Trunk.")];
+  expect((await g.mergeQueue(pr))?.state).toBe("failed"); expect(pr.checks[1]?.app).toBe("trunk-io");
+  expect(calls).toHaveLength(1); expect(calls[0]![2]).toContain("check_name=Trunk%20Merge%20Queue");
+});

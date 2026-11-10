@@ -1,4 +1,4 @@
-import { QueueSubmissionRejected, parseTrunkComments, parseTrunkCheck, type QueueObservation } from "./merge-queue";
+import { QueueSubmissionRejected, parseTrunkComments, parseTrunkCheck, trunkURL, type QueueObservation } from "./merge-queue";
 import { command } from "./command";
 import type { Config, Snapshot, ReviewThreadAssessment } from "./model";
 import { diagnosticText, namedTestFailures, type CIEvidence, type CheckFailureReport } from "./check-evidence";
@@ -27,6 +27,14 @@ export class GitHub {
     if (pr.state !== "OPEN") return undefined;
     try {
       const bot = parseTrunkComments(await this.queueComments(pr.number), pr);
+      // Resolve app identity only for the queue check; ordinary matrix checks
+      // do not need extra provider metadata in the broad GraphQL queries.
+      const candidate = pr.checks.find(c => c.name === `Trunk Merge Queue (${pr.base})` && trunkURL(c.url));
+      if (candidate) {
+        const data = JSON.parse(await this.request(["gh", "api", `repos/${this.config.repository}/commits/${encodeURIComponent(pr.head)}/check-runs?check_name=${encodeURIComponent(candidate.name)}&filter=latest&per_page=100`]));
+        const trusted = data.check_runs?.find((run: any) => run.app?.slug === "trunk-io" && run.head_sha === pr.head && run.name === candidate.name && run.details_url === candidate.url && run.status?.toUpperCase() === candidate.status && (run.conclusion?.toUpperCase() ?? null) === candidate.conclusion);
+        candidate.app = trusted?.app.slug;
+      }
       const check = parseTrunkCheck(pr);
       return bot && bot.state !== "available" ? bot : check ?? bot;
     } catch {
@@ -139,10 +147,10 @@ export class GitHub {
   }
   async prepareBatch(numbers: number[]): Promise<void> {
     const [owner, name] = this.config.repository.split("/");
-    for (let offset = 0; offset < numbers.length; offset += 25) {
-      const batch = numbers.slice(offset, offset + 25);
+    for (let offset = 0; offset < numbers.length; offset += 5) {
+      const batch = numbers.slice(offset, offset + 5);
       if (batch.some(n => !Number.isSafeInteger(n) || n <= 0)) throw new Error("Invalid PR number");
-      const selections = batch.map(n => `p${n}:pullRequest(number:${n}){number title url headRefOid headRefName baseRefName baseRefOid state isDraft mergeable mergeStateStatus reviewDecision body updatedAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}} reviewRequests(first:100){nodes{requestedReviewer{...on User{login} ...on Team{name slug}}} pageInfo{hasNextPage}} reviewThreads(first:20){nodes{id isResolved comments(first:10){nodes{author{login __typename} body url} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}} reviews(first:30){nodes{author{login} state body commit{oid} submittedAt} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{...on CheckRun{isRequired(pullRequestNumber:${n}) name status conclusion detailsUrl startedAt checkSuite{app{slug} workflowRun{id createdAt workflow{id}}}} ...on StatusContext{isRequired(pullRequestNumber:${n}) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`).join(" ");
+      const selections = batch.map(n => `p${n}:pullRequest(number:${n}){number title url headRefOid headRefName baseRefName baseRefOid state isDraft mergeable mergeStateStatus reviewDecision body updatedAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}} reviewRequests(first:100){nodes{requestedReviewer{...on User{login} ...on Team{name slug}}} pageInfo{hasNextPage}} reviewThreads(first:20){nodes{id isResolved comments(first:10){nodes{author{login __typename} body url} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}} reviews(first:30){nodes{author{login} state body commit{oid} submittedAt} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{...on CheckRun{isRequired(pullRequestNumber:${n}) name status conclusion detailsUrl startedAt checkSuite{workflowRun{id createdAt workflow{id}}}} ...on StatusContext{isRequired(pullRequestNumber:${n}) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`).join(" ");
       const result = JSON.parse(await this.request(["gh", "api", "graphql", "-f", `query=query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${selections}}}`]));
       if (result.errors) throw new Error("GitHub batch query failed: " + JSON.stringify(result.errors));
       for (const n of batch) {
@@ -230,7 +238,7 @@ export class GitHub {
     let cursor: string | null = null;
     const checks: Snapshot["checks"] = [];
     do {
-      const args = ["gh", "api", "graphql", "-f", "query=query($owner:String!,$name:String!,$head:GitObjectID!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{... on CheckRun{isRequired(pullRequestNumber:$number) name status conclusion detailsUrl startedAt checkSuite{app{slug} workflowRun{id createdAt workflow{id}}}} ... on StatusContext{isRequired(pullRequestNumber:$number) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}", "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `head=${pr.headRefOid}`, "-F", `number=${number}`];
+      const args = ["gh", "api", "graphql", "-f", "query=query($owner:String!,$name:String!,$head:GitObjectID!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{... on CheckRun{isRequired(pullRequestNumber:$number) name status conclusion detailsUrl startedAt checkSuite{workflowRun{id createdAt workflow{id}}}} ... on StatusContext{isRequired(pullRequestNumber:$number) context state description targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}", "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `head=${pr.headRefOid}`, "-F", `number=${number}`];
       if (cursor) args.push("-f", `cursor=${cursor}`);
       const result = !cursor && pr._checks ? { data: { repository: { object: { statusCheckRollup: { contexts: pr._checks } } } } } : JSON.parse(await this.request(args));
       if (result.errors) throw new Error(JSON.stringify(result.errors));

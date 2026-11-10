@@ -123,11 +123,15 @@ export class Controller {
   }
   async sync(): Promise<void> {
     if (this.syncing || this.dispatching || this.acting || this.budgetChecking || this.sleeping) return;
-    this.syncing = true;
+    this.syncing = true; this.error = null;
     try {
       const attention = this.store.all().filter(r => r.decision.kind === "human").map(r => r.snapshot.number);
       const numbers = stackOrder([...new Set([...attention, ...await this.github.list(), ...this.store.all().filter(r => r.snapshot.state === "OPEN").map(r => r.snapshot.number)])], this.store.all());
-      await this.github.prepareBatch?.(numbers);
+      try { await this.github.prepareBatch?.(numbers); }
+      catch (error) {
+        if (this.github.authenticationError || /rate limit/i.test(String(error))) throw error;
+        this.store.log(null, `Batch refresh unavailable; checking PRs individually: ${String(error).slice(0, 300)}`);
+      }
       for (const number of numbers) {
         try { await this.withPR(number, async () => { await this.reconcile(await this.github.snapshot(number)); }); }
         catch (error) {
