@@ -1,0 +1,21 @@
+{
+  "name": "woodshed",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "demo": "WOODSHED_DEMO=1 bun src/server.ts",
+    "test": "bun test",
+    "mcp": "bun src/mcp.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.2.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

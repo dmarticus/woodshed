@@ -1,0 +1,27 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+const token = readFileSync(process.env.WOODSHED_TOKEN_PATH ?? join(homedir(), "Library/Application Support/Woodshed/api-token"), "utf8").trim();
+const auth = { Authorization: `Bearer ${token}` };
+const base = process.env.WOODSHED_URL ?? "http://127.0.0.1:7341";
+function assert(ok: unknown, message: string): asserts ok { if (!ok) throw new Error(message); }
+const state = await fetch(`${base}/api/state`, { headers: auth }).then(r => r.json());
+assert(state.demo && !state.automation && state.prs.length === 4, "Expected demo data with automation disabled");
+const root = await fetch(base, {headers:auth});
+assert(root.status === 200 && (await root.json()).interface === "macOS menu bar", "Expected native controller status");
+assert((await fetch(`${base}/app.js`, {headers:auth})).status === 404, "Web UI must no longer be served");
+const rejected = await fetch(`${base}/api/prs/104/pause`, { method: "POST", headers: { Origin: "https://example.com", "X-Woodshed": "1" } });
+assert(rejected.status === 401, "Cross-origin mutations must be rejected");
+const headers = auth;
+assert((await fetch(`${base}/api/prs/104/pause`, { method: "POST", headers })).ok, "Pause should succeed");
+const paused = await fetch(`${base}/api/state`, { headers: auth }).then(r => r.json());
+assert(paused.prs.find((r: any) => r.snapshot.number === 104).paused, "Pause must persist");
+assert((await fetch(`${base}/api/prs/104/resume`, { method: "POST", headers })).ok, "Resume should succeed");
+const saved = await fetch(`${base}/api/settings`, { method: "POST", headers, body: JSON.stringify({ mode: "paused", maxAttempts: 4, defaultModel: "gpt-6.1-sol", runCapUSD: 2, dailyCapUSD: 10 }) });
+assert(saved.ok, "Settings should save");
+const settings = await fetch(`${base}/api/state`, { headers: auth }).then(r => r.json());
+assert(settings.settings.paused && settings.settings.maxAttempts === 4, "Settings must take effect without restarting");
+assert(settings.mode === "paused" && !settings.automation && settings.settings.defaultModel === "gpt-6.1-sol", "Canonical mode and model must save");
+assert(settings.spend.capUSD === 10 && settings.settings.runCapUSD === 2 && Array.isArray(settings.runs), "Spend and run history must be available");
+assert((await fetch(`${base}/api/prs/104/unwatch`, { method: "POST", headers })).status === 409, "Previews must reject live actions");
+console.log("HTTP smoke passed: native API, origin protection, canonical modes, models, spend, run history, preview isolation");

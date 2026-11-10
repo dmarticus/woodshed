@@ -1,0 +1,10 @@
+node_modules/
+.woodshed/
+dist/
+woodshed.config.json
+.DS_Store
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]

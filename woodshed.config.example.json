@@ -1,0 +1,18 @@
+{
+  "repository": "PostHog/posthog",
+  "author": "@me",
+  "checkout": "/absolute/path/to/posthog",
+  "pollSeconds": 90,
+  "maxAttempts": 3,
+  "maxConcurrentJobs": 1,
+  "mode": "watch",
+  "watchFilter": "mine",
+  "defaultModel": "gpt-6.1-terra",
+  "escalateOnRetry": false,
+  "retryModel": "",
+  "runCapUSD": 5,
+  "dailyCapUSD": 20,
+  "port": 7341,
+  "reviewLabel": "posthog-review",
+  "approvalLabel": "stamphog"
+}
