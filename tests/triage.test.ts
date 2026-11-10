@@ -3,6 +3,7 @@ import { Controller } from "../src/controller";
 import { Store } from "../src/store";
 import { decide, fingerprint, type AssessmentResult, type Config, type Snapshot } from "../src/model";
 import { assessmentKey, parseAssessment } from "../src/triage";
+import { routeWithCIEvidence } from "../src/check-evidence";
 import { localDay } from "../src/usage";
 import { checkWithJev } from "../src/jev";
 
@@ -252,4 +253,21 @@ test("legacy mixed review/CI escalation gets one bounded investigation without r
 test("owner response is validated and preserved for an external prerequisite", () => {
   expect(parseAssessment({ ...answer(), response: "recheck" }, "abc").response).toBe("recheck");
   expect(() => parseAssessment({ ...answer(), response: "retry" }, "abc")).toThrow("response type");
+});
+
+
+test("legacy provider-login asks refresh once with GitHub test diagnostics attached and keep the repair bound", async () => {
+  const h = harness(); const record = h.store.get(42)!;
+  record.humanHead = undefined; record.snapshot.checks[0].conclusion = "FAILURE";
+  const evidence = { head: "abc", reports: [{ name: "Tests", github_url: "https://github.com/example/project/runs/123", provider_url: "https://depot.dev/job/123", title: "1 failing test", summary: "AssertionError in tests/test_example.py::test_flag", text: "", annotations: [], test_failures: ["tests/test_example.py::test_flag"] }], unavailable: [] };
+  let reads = 0; (h.controller.github as any).failureEvidence = async () => { reads++; return evidence; };
+  record.assessment = { head: "abc", key: assessmentKey(record.snapshot), report: "Provider logs need login", attempts: 1, followups: 2, result: { ...answer(), category: "checks", response: "recheck" } };
+  h.store.put(record); await h.controller.reconcile(record.snapshot);
+  expect(h.store.get(42)?.job?.ciEvidence).toEqual(evidence);
+  expect(h.store.get(42)?.assessment).toMatchObject({ ciEvidenceVersion: 1, followups: 2 });
+  h.outcome({ state: "triaged", assessment: routeWithCIEvidence({ ...answer(), category: "checks" }, evidence) });
+  await h.controller.reconcile(record.snapshot);
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "CI still needs a fix", response: "retry" });
+  expect(reads).toBe(1); expect(h.launches()).toBe(1);
+  await h.controller.reconcile(record.snapshot); expect(reads).toBe(1); expect(h.launches()).toBe(1);
 });

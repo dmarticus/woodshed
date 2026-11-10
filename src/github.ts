@@ -1,6 +1,7 @@
 import { command } from "./command";
 import type { Config, Snapshot, ReviewThreadAssessment } from "./model";
-import { currentChecks } from "./model";
+import { diagnosticText, namedTestFailures, type CIEvidence, type CheckFailureReport } from "./check-evidence";
+import { failed, currentChecks } from "./model";
 import { infrastructureKind, type InfrastructureSignal } from "./ci-incidents";
 
 export class GitHub {
@@ -11,6 +12,44 @@ export class GitHub {
   private primed = new Map<number, any>();
   private conditional = new Map<string, { etag: string; data: any }>();
   private signalCache = new Map<string, { time: number; signal?: InfrastructureSignal }>();
+  async failureEvidence(pr: Snapshot): Promise<CIEvidence> {
+    const failures = pr.checks.filter(failed);
+    const evidence: CIEvidence = { head: pr.head, reports: [], unavailable: [] };
+    if (!failures.length) return evidence;
+    const found = new Set<string>();
+    try {
+      for (let page = 1; page <= 10; page++) {
+        const data = JSON.parse(await this.request(["gh", "api", `repos/${this.config.repository}/commits/${encodeURIComponent(pr.head)}/check-runs?filter=latest&per_page=100&page=${page}`]));
+        if (!Array.isArray(data.check_runs)) throw Error("Invalid GitHub check response");
+        for (const run of data.check_runs) {
+          const check = failures.find(c => c.name === run.name && (!c.url || c.url === run.details_url) && (!c.startedAt || Date.parse(c.startedAt) === Date.parse(run.started_at)));
+          if (!check || found.has(check.name) || run.head_sha !== pr.head || !Number.isSafeInteger(run.id) || run.id <= 0 || run.status !== "completed" || String(run.conclusion).toUpperCase() !== check.conclusion) continue;
+          const report: CheckFailureReport = {
+            name: check.name, github_url: `https://github.com/${this.config.repository}/runs/${run.id}`,
+            provider_url: check.url, title: diagnosticText(run.output?.title, 300),
+            summary: diagnosticText(run.output?.summary, 12000), text: diagnosticText(run.output?.text, 12000), annotations: [], test_failures: [],
+          };
+          if (run.output?.annotations_count > 0) {
+            try {
+              for (let annotationPage = 1; annotationPage <= 2; annotationPage++) {
+                const rows = JSON.parse(await this.request(["gh", "api", `repos/${this.config.repository}/check-runs/${run.id}/annotations?per_page=100&page=${annotationPage}`]));
+                if (!Array.isArray(rows)) throw Error("Invalid GitHub annotations");
+                report.annotations.push(...rows.map(a => ({ path: diagnosticText(a.path, 500), line: a.start_line, message: diagnosticText([a.title, a.message, a.raw_details].filter(Boolean).join("\n"), 2000) })));
+                if (rows.length < 100) break;
+              }
+            } catch { evidence.unavailable.push({ name: check.name, reason: "Some GitHub annotations could not be read; the check summary is still available." }); }
+          }
+          report.annotations = report.annotations.slice(0, 30);
+          report.test_failures = namedTestFailures(report);
+          evidence.reports.push(report); found.add(check.name);
+          if (evidence.reports.length >= 6) break;
+        }
+        if (data.check_runs.length < 100 || found.size === failures.length || evidence.reports.length >= 6) break;
+      }
+    } catch { /* Preserve summaries already collected if a later page is unavailable. */ }
+    for (const check of failures) if (!found.has(check.name)) evidence.unavailable.push({ name: check.name, reason: "A matching current-head GitHub check report could not be read." });
+    return evidence;
+  }
   async failureSignal(pr: Snapshot, check: Snapshot["checks"][number]): Promise<InfrastructureSignal | undefined> {
     let url: URL;
     try { url = new URL(check.url); } catch { return undefined; }

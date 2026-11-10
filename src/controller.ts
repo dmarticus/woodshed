@@ -318,6 +318,7 @@ export class Controller {
         this.store.put(record);
         this.store.saveRun(this.initialRun(record.job, snapshot.number));
         try {
+          if (record.job.kind === "repair" && this.github.failureEvidence) { record.job.ciEvidence = await this.github.failureEvidence(snapshot); this.store.put(record); }
           await this.runner.launch(snapshot, record.job);
           for (const id of record.job.playbooksApplied ?? []) this.playbooks.applied(snapshot.number, record.job, id);
         }
@@ -486,11 +487,17 @@ export class Controller {
       return false;
     }
     const key = assessmentKey(pr);
-    if (assessment.key !== key) { assessment.key = key; assessment.result = undefined; assessment.attempts = 0; }
+    if (assessment.key !== key) { assessment.key = key; assessment.result = undefined; assessment.attempts = 0; assessment.ciEvidence = undefined; }
     // Older investigations hid failed CI behind a reviewer wait. Refresh that
     // exhausted escalation once, retaining the repair limit and spend history.
     if (!assessment.attentionVersion && assessment.followups >= 2 && assessment.result?.route === "wait" && assessment.result.category === "review" && pr.checks.some(failed)) {
       assessment.attentionVersion = 1; assessment.result = undefined; assessment.attempts = 0;
+    }
+    // Refresh old CI-access escalations once against GitHub's own diagnostics.
+    // Keep substantive repair counters and spend history intact.
+    if (!assessment.ciEvidenceVersion && assessment.result?.route === "ask" && assessment.result.category === "checks" && !assessment.result.ci_access && pr.checks.some(failed) && this.github.failureEvidence) {
+      assessment.ciEvidence = await this.github.failureEvidence(pr); assessment.ciEvidenceVersion = 1;
+      assessment.result = undefined; assessment.attempts = 0;
     }
     let result = assessment.result;
     if (result?.route === "wait" && result.category === "review") {
@@ -586,7 +593,10 @@ export class Controller {
     const job: Job = { name: `ws-triage-${pr.number}-${randomUUID().slice(0, 8)}`, head: pr.head, fingerprint: record.fingerprint, startedAt: new Date().toISOString(), kind: "triage", model: this.config.defaultModel, budgetUSD: budget, adapter: "app-server" };
     record.job = job; assessment.attempts++;
     this.store.put(record); this.store.saveRun(this.initialRun(job, pr.number));
-    try { await this.runner.launchTriage(pr, job, assessment.report + (assessment.reply ? `\nOwner answer: ${assessment.reply}` : "") + (assessment.sourceJob ? `\nOriginal run: ${assessment.sourceJob.name}. Follow-ups already attempted: ${assessment.followups}.` : "")); }
+    try {
+      job.ciEvidence = assessment.ciEvidence?.head === pr.head ? assessment.ciEvidence : await this.github.failureEvidence?.(pr);
+      this.store.put(record);
+      await this.runner.launchTriage(pr, job, assessment.report + (assessment.reply ? `\nOwner answer: ${assessment.reply}` : "") + (assessment.sourceJob ? `\nOriginal run: ${assessment.sourceJob.name}. Follow-ups already attempted: ${assessment.followups}.` : "")); }
     catch (error) {
       this.store.log(pr.number, `Investigation startup failed: ${String(error)}`);
       try { await this.runner.stop(job); } catch { }
