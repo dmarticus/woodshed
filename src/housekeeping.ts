@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, realpathSync, rmdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { command } from "./command";
 import type { Store } from "./store";
@@ -19,12 +19,9 @@ export async function cleanArtifacts(dataDir: string, store: Store, now = Date.n
     const run = store.run(name);
     if (!run?.endedAt || ["running", "waiting", "budget"].includes(run.state)) continue;
     const record = store.get(run.number);
-    if (!record || record.snapshot.state === "OPEN" || !record.closedAt || now - Date.parse(record.closedAt) < 7 * 86400000) continue;
+    if (!record) continue;
     const runtimeFile = Bun.file(join(directory, "runtime.json"));
-    if (await runtimeFile.exists()) {
-      const runtime = await runtimeFile.json();
-      if (["working", "blocked"].includes(runtime.status)) continue;
-    }
+    if (await runtimeFile.exists() && (await runtimeFile.json()).status === "working") continue;
     const checkout = join(directory, "checkout");
     if (existsSync(checkout)) {
       if (lstatSync(checkout).isSymbolicLink() || realpathSync(checkout) !== join(realpathSync(directory), "checkout")) continue;
@@ -32,7 +29,9 @@ export async function cleanArtifacts(dataDir: string, store: Store, now = Date.n
       else try {
         const tracked = (await exec(["git", "rev-parse", "--show-toplevel"], { cwd: checkout })).trim();
         if (realpathSync(tracked) !== realpathSync(checkout)) continue;
-        if ((await exec(["git", "status", "--porcelain", "--untracked-files=all", "--ignored"], { cwd: checkout })).trim()) continue;
+        // Superseded runs release their checkout once nothing unpublished remains; ignored build output and dependencies do not count.
+        if ((await exec(["git", "status", "--porcelain", "--untracked-files=all"], { cwd: checkout })).trim()) continue;
+        if ((await exec(["git", "rev-list", "-1", "HEAD", "--not", "--remotes"], { cwd: checkout })).trim()) continue;
         const registered = (await exec(["git", "worktree", "list", "--porcelain"], { cwd: checkout })).split("\n").filter(line => line.startsWith("worktree ")).some(line => { try { return realpathSync(line.slice(9)) === realpathSync(checkout); } catch { return false; } });
         if (registered) {
           const common = (await exec(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: checkout })).trim();
@@ -42,9 +41,28 @@ export async function cleanArtifacts(dataDir: string, store: Store, now = Date.n
       if (existsSync(checkout)) continue;
       store.log(run.number, `Removed clean worktree for retained run ${name}`);
     }
+    if (record.snapshot.state === "OPEN" || !record.closedAt || now - Date.parse(record.closedAt) < 7 * 86400000) continue;
     if (now - Date.parse(run.endedAt) >= 30 * 86400000 && artifactAge >= 30 * 86400000) {
       rmSync(directory, { recursive: true });
       store.log(run.number, `Removed expired run artifacts for ${name}; spend history retained`);
     }
   }
+}
+
+// herdr-core 0.1.19 `connect` relays outlive their SSH session when the Mac drops it (sleep, Wi-Fi), one per reconnect.
+// A relay whose parent is no longer sshd has no client left, so stop it before hundreds accumulate.
+export function reapOrphanedConnects(proc = "/proc", uid = process.getuid?.(), kill: (pid: number) => unknown = pid => process.kill(pid, "SIGTERM")): number {
+  if (!existsSync(proc)) return 0;
+  let reaped = 0;
+  for (const pid of readdirSync(proc).filter(name => /^\d+$/.test(name))) {
+    try {
+      if (lstatSync(join(proc, pid)).uid !== uid) continue;
+      const argv = readFileSync(join(proc, pid, "cmdline"), "utf8").split("\0").filter(Boolean);
+      if (argv.length !== 2 || !/(^|\/)(herdr-core|hc)$/.test(argv[0]) || argv[1] !== "connect") continue;
+      const parent = readFileSync(join(proc, pid, "stat"), "utf8").replace(/^.*\) /s, "").split(" ")[1];
+      if (/^sshd/.test(readFileSync(join(proc, parent, "comm"), "utf8").trim())) continue;
+      kill(Number(pid)); reaped++;
+    } catch { /* The process exited while being inspected. */ }
+  }
+  return reaped;
 }

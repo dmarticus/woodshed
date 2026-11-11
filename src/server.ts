@@ -7,7 +7,7 @@ import { Store } from "./store";
 import { Settings } from "./settings";
 import { loadAPIToken } from "./api-auth";
 import { StateEvents } from "./events";
-import { cleanArtifacts } from "./housekeeping";
+import { cleanArtifacts, reapOrphanedConnects } from "./housekeeping";
 import { PowerGuard } from "./power";
 import { handler, publicState } from "./http";
 import { modeOf, type Config } from "./model";
@@ -67,7 +67,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
 });
 if (!demo) {
   void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`));
-  setInterval(() => { void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`)); }, 6 * 3600000);
+  setInterval(() => { void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`)); }, 3600000);
+  setInterval(() => { const reaped = reapOrphanedConnects(); if (reaped) store.log(null, `Housekeeping: stopped ${reaped} orphaned hc connect relays`); }, 5 * 60_000);
   void controller.runner.models.list().catch(error => console.error(`Model catalog: ${error.message}`));
   void controller.sync();
   setInterval(() => { void controller.decisions.processPending().catch(error => store.log(null, `Decision promotion deferred: ${error.message}`)); }, 30_000);
