@@ -16,6 +16,7 @@ import { parseAssessment, triagePrompt } from "./triage";
 import { missingSession, temporaryFailure } from "./recovery";
 import { handoffContext } from "./handoff";
 import { repairContext, type PublishedResult } from "./playbooks";
+import { readWorkerToken, workerCommand } from "./worker-credentials";
 
 export class Runner {
   models: Models;
@@ -56,7 +57,12 @@ export class Runner {
     const queue = await new GitHub(this.config, this.exec).mergeQueue(current);
     if (!queue || queue.error || queue.state === "unknown" || activeQueuePhase(queue.state)) throw Error("PR is in the merge queue or its queue status could not be confirmed. Saved edits are retained; no publication was attempted.");
   }
+  private checkWorkerToken(): void { if (this.config.workerGitHubTokenPath) readWorkerToken(this.config.workerGitHubTokenPath); }
+  private startWorker(job: Job, cwd: string, argv: string[]): Promise<string> {
+    return this.exec(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", cwd, ...workerCommand(this.config, join(this.dataDir, "jobs", job.name), argv)], { timeout: 90_000 });
+  }
   async launch(pr: Snapshot, job: Job): Promise<void> {
+    this.checkWorkerToken();
     try {
       await this.preparation(pr.number, job, "Preparing the PR checkout");
       await this.prepare(pr, job);
@@ -137,7 +143,7 @@ Do not approve visual baselines. Stop for visual inspection, product decisions, 
 Only ask the owner about a verified actionable blocker. Non-blocking CI report warnings, advisory bundle-size deltas, successful visual statuses, and already-quarantined visual differences are not reasons to request a decision. The owner has explicitly asked to keep those out of Needs you. Cancelled jobs replaced by a newer workflow run are historical evidence, not current repair work.
 Reply only in review threads when needed, ending each reply with 'via Woodshed'. No top-level PR comments.
 Do not resolve a human's thread unless the requested fix is unambiguous and verified. React to PostHog Review findings per repository policy.
-Use the repository's permitted publishing tools and hooks. Never bypass hooks or force-push.
+${this.config.workerGitHubTokenPath ? "Your GitHub token is read-only, so you cannot reply to, react to, or resolve review threads. Put any reply a reviewer still needs in your result reason.\n" : ""}Use the repository's permitted publishing tools and hooks. Never bypass hooks or force-push.
 Woodshed checks the live PR target and remote head before publication. Prefer gh API reads for current PR state; you do not need to fetch Git refs merely to inspect reviews or CI.
 Do not stage, commit, or push changes yourself. Woodshed's controller owns signing and publishing after validating the current PR head and the exact changed file set. Leave all intended changes in this worktree.
 This is one bounded repair attempt. Verify one coherent increment and return its declared files, then stop; the controller owns publication, CI waiting, and subsequent attempts.
@@ -154,6 +160,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     await this.startAgent(job, checkout, resultDirectory, directed, pr.number);
   }
   async launchTriage(pr: Snapshot, job: Job, report: string): Promise<void> {
+    this.checkWorkerToken();
     const directory = join(this.dataDir, "jobs", job.name);
     const checkout = join(directory, "checkout");
     const results = join(directory, "agent-result");
@@ -164,6 +171,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     await this.startAgent(job, checkout, results, prompt, pr.number);
   }
   async resume(job: Job, instructions: string): Promise<void> {
+    this.checkWorkerToken();
     const directory = join(this.dataDir, "jobs", job.name);
     const path = join(directory, "worker.json");
     const config = await Bun.file(path).json();
@@ -182,7 +190,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     const followup = job.contextReview ? "Historical tradeoff review" : "Independent GitHub investigation follow-up";
     config.prompt = `${await Bun.file(join(directory, "prompt.txt")).text()}\n${followup}:\n${instructions}`;
     await Bun.write(`${path}.tmp`, JSON.stringify(config)); renameSync(`${path}.tmp`, path);
-    await this.exec(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", config.checkout, process.execPath, join(import.meta.dir, "worker.ts"), path], { timeout: 90_000 });
+    await this.startWorker(job, config.checkout, [process.execPath, join(import.meta.dir, "worker.ts"), path]);
   }
   private async startAgent(job: Job, checkout: string, resultDirectory: string, prompt: string, number: number): Promise<void> {
     await this.preparation(number, job, "Starting the coding agent");
@@ -194,11 +202,10 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       const path = join(directory, "worker.json");
       await Bun.write(`${path}.tmp`, JSON.stringify({ id: job.name, number, checkout, directory, resultDirectory, model: model.id, price: model.price, prices: { ...publishedPrices, ...this.config.modelPrices }, budgetUSD: job.budgetUSD ?? this.config.runCapUSD ?? 5, dailyCapUSD: this.config.dailyCapUSD ?? 20, gitSigningKey: this.config.gitSigningKey, purpose: job.kind === "triage" ? "triage" : "repair", startedAt: job.startedAt, prompt, dbPath: join(this.dataDir, "state.sqlite") }));
       renameSync(`${path}.tmp`, path);
-      await this.exec(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", checkout, process.execPath, join(import.meta.dir, "worker.ts"), path], { timeout: 90_000 });
+      await this.startWorker(job, checkout, [process.execPath, join(import.meta.dir, "worker.ts"), path]);
       return;
     }
-    await this.exec(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", checkout,
-      "codex", "--no-daemon", "--sandbox", "workspace-write", "--ask-for-approval", "on-request", "--add-dir", resultDirectory, prompt], { timeout: 90_000 });
+    await this.startWorker(job, checkout, ["codex", "--no-daemon", "--sandbox", "workspace-write", "--ask-for-approval", "on-request", "--add-dir", resultDirectory, prompt]);
   }
   private async resultPath(job: Job): Promise<string> {
     const directory = join(this.dataDir, "jobs", job.name);

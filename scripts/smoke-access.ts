@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { command } from "../src/command";
 import { publishedPrices } from "../src/usage";
 import { gitEnvironment } from "../src/git-environment";
+import { workerCommand } from "../src/worker-credentials";
 
 const config = await Bun.file(process.argv[2]).json();
 if (!config.gitSigningKey) throw new Error("Complete setup-signing before running this smoke test");
@@ -22,7 +23,7 @@ const path = join(directory, "worker.json"); const model = "gpt-6.1-sol";
 await Bun.write(path, JSON.stringify({ id: name, number: 0, checkout: directory, directory, resultDirectory, model, price: publishedPrices[model], prices: publishedPrices, budgetUSD: 1, startedAt: new Date().toISOString(), prompt: `Verify routine GitHub access without asking for permission: run gh api repos/PostHog/posthog/pulls/130393 --jq .number; run git remote get-url origin and git ls-remote origin HEAD. After all commands succeed create verified.txt containing 'GitHub read verified'. Do not stage, commit, push, or mutate GitHub. The controller will sign this locally. Write ${join(resultDirectory, "result.json")} with {"outcome":"ready_to_publish","files":["verified.txt"],"reason":"GitHub read verified"} only if all commands succeed, otherwise {"outcome":"needs_human","reason":"the verified failure"}. Stop.` }));
 let started = false;
 try {
-  await command(["hc", "run", "--json", "--bg", "--no-parent", "--name", name, "--cwd", directory, process.execPath, join(import.meta.dir, "../src/worker.ts"), path]); started = true;
+  await command(["hc", "run", "--json", "--bg", "--no-parent", "--name", name, "--cwd", directory, ...workerCommand(config, directory, [process.execPath, join(import.meta.dir, "../src/worker.ts"), path])]); started = true;
   await command(["hc", "wait", "--json", "--timeout", "90", name], { timeout: 100_000 });
   const state = await Bun.file(join(directory, "runtime.json")).json();
   if (state.status !== "done") throw new Error(`Access smoke stopped: ${state.summary}`);

@@ -63,6 +63,22 @@ It creates an Ed25519 signing key under `~/Library/Application Support/Woodshed/
 
 The config records only `gitSigningKey`, the private key's absolute path. Restart the controller after setup. Existing active workers can be updated with `bun scripts/upgrade-workers.ts <PR numbers>` while the controller is stopped. This retains their worktrees, Codex threads, spend, and concurrency limits; genuine product questions remain waiting.
 
+#### Read-only worker token
+
+Workers read untrusted text: review comments, CI logs, and repository content. Give them their own read-only GitHub token so that a prompt injection cannot use the controller's login, which can push and change workflows. The controller still does every commit and push.
+
+```sh
+bun scripts/setup-worker-token.ts
+```
+
+The script explains how to create a fine-grained token for the watched repository only, with read access to Actions, Checks, Commit statuses, Contents, Issues, and Pull requests. It checks that the token can read the repository and that GitHub refuses a write, saves it as `worker-github-token` in the Woodshed support directory with mode 0600, and records its path as `workerGitHubTokenPath` in the config. Restart the controller after setup.
+
+Each worker starts through `src/worker-launch.ts`, which reads the token file at startup. Workers get it as `GH_TOKEN`, with an empty per-run `GH_CONFIG_DIR` and a Git credential helper that supplies only this token, so `gh` and Git cannot fall back to the controller's login. The token never appears in argv, prompts, logs, `worker.json`, or the config. The controller's own `gh` and Git processes are unchanged.
+
+If `workerGitHubTokenPath` is set but the file is missing, unreadable, malformed, or readable by other users, Woodshed does not start or resume workers. Affected PRs show **Fix the worker GitHub token**, and `/health` reports `worker-token-unreadable`. Without the setting, workers share the controller's login as before, and `/health` reports `worker-token-shared`.
+
+With a read-only token, agents cannot reply to, react to, or resolve review threads. They put a reply that a reviewer needs in their result instead. This step does not prevent a worker from reading the controller's credential files, because both run as the same user.
+
 Automation settings choose the default model and optionally escalate to another model after a failed attempt. Available models come from your local Codex catalog, using your existing login. A per-run override does not change that default.
 
 ### Spend

@@ -53,6 +53,8 @@ export type Config = {
   modelPrices?: { [model: string]: ModelPrice }; watchFilter?: "mine" | "mine-and-reviews" | "query"; watchQuery?: string;
   workerProtocol?: "app-server";
   gitSigningKey?: string;
+  // Owner-only file holding a read-only, single-repository token. When unset, workers share the controller's gh login.
+  workerGitHubTokenPath?: string;
   // Integrations whose absence should warn in /health and block a deploy, instead of degrading silently.
   requiredIntegrations?: ("typesafe" | "posthog")[];
 };

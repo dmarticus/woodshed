@@ -22,6 +22,7 @@ import { ownerAttention, attentionStillNeeded } from "./owner-attention";
 import { QueueSubmissionRejected, trackMergeQueue, mergeQueueDecision } from "./merge-queue";
 import { queueSubmission } from "./merge-queue-readiness";
 import { buildInfo } from "./build-info";
+import { workerCredentialProblem } from "./worker-credentials";
 
 export class Controller {
   syncing = false;
@@ -53,6 +54,9 @@ export class Controller {
     if (herdr && herdr.consecutiveFailures >= 3) warnings.push({ id: "herdr-failing", message: `Herdr has failed ${herdr.consecutiveFailures} commands in a row since ${herdr.failingSince}, so runs cannot be checked or started. Run \`hc server restart\` on the controller host${herdr.lastError ? `. Last error: ${herdr.lastError}` : ""}` });
     const disk = diskUsage(this.runner.dataDir);
     if (disk && disk.usedPercent >= 80) warnings.push({ id: "disk-low", message: `Controller disk is ${disk.usedPercent}% full (${disk.freeGB} GB free). Runs, herdr, and deploys fail when it fills` });
+    const workerToken = workerCredentialProblem(this.config);
+    if (!this.config.workerGitHubTokenPath) warnings.push({ id: "worker-token-shared", message: "Workers use the controller's GitHub login. Run scripts/setup-worker-token.ts to give them a read-only token" });
+    else if (workerToken) warnings.push({ id: "worker-token-unreadable", message: `Workers will not start: ${workerToken}` });
     return warnings;
   }
   power(event: "sleep" | "wake", confirmed = true): void {
@@ -111,7 +115,7 @@ export class Controller {
     if (analytics) this.telemetry = new ProductAnalytics(analytics, store, config, now);
   }
   async prepareAttention(): Promise<void> {
-    if (modeOf(this.config) !== "auto" || !this.runner.launchTriage) return;
+    if (modeOf(this.config) !== "auto" || !this.runner.launchTriage || workerCredentialProblem(this.config)) return;
     for (const record of this.store.all().filter(r => r.decision.kind === "human" && !r.assessment && !r.budgetDay && !r.paused && r.watching !== false && r.snapshot.state === "OPEN" && !r.snapshot.draft)) {
       try {
         await this.refreshHuman(record);
@@ -274,7 +278,7 @@ export class Controller {
       const run = await this.runner.telemetry(record.job);
       if (run) { this.store.saveRun(run); if (record.sleepInterruptedAt && run.updatedAt && Date.parse(run.updatedAt) > Date.parse(this.resumedAt ?? record.sleepInterruptedAt)) record.sleepInterruptedAt = undefined; }
     }
-    if (!observeOnly && record.resumeRequested && record.job && this.activeSlots(snapshot.number) < this.parallelLimit() && modeOf(this.config) !== "paused") {
+    if (!observeOnly && record.resumeRequested && record.job && this.activeSlots(snapshot.number) < this.parallelLimit() && modeOf(this.config) !== "paused" && !workerCredentialProblem(this.config)) {
       try { this.admitted(); await this.runner.resume(record.job, record.resumeRequested); }
       catch (error) {
         const instructions = record.resumeRequested;
@@ -363,6 +367,9 @@ export class Controller {
     if (record.pendingReply) record.decision = { kind: "waiting", reason: "Your reply is queued until a run slot is available" };
     if (record.decision.kind === "fix" && record.attempts >= this.config.maxAttempts)
       record.decision = { kind: "human", reason: `${record.attempts} attempts without clearing this feedback. Inspect before retrying.` };
+    const workerToken = workerCredentialProblem(this.config);
+    if ((record.decision.kind === "fix" && (modeOf(this.config) === "auto" || record.runRequested) || record.resumeRequested) && workerToken)
+      record.decision = { kind: "human", title: "Fix the worker GitHub token", reason: `${workerToken}. Woodshed won't start workers with the controller's GitHub login.` };
     if (await this.assess(record, observeOnly)) {
       if (!record.stateSince || previousKind !== record.decision.kind || previousHead !== snapshot.head) record.stateSince = new Date().toISOString();
       bindDecision(record);
@@ -529,6 +536,8 @@ export class Controller {
     if (run?.costUSD === null || remaining <= 0 || this.store.spend(this.config.dailyCapUSD ?? 20).unknownRuns || remaining > (this.config.dailyCapUSD ?? 20) - this.store.spent(localDay()) - others) {
       record.decision = { kind: "human", title: "Review the run budget", reason: "The interrupted run cannot resume within its spend limit. Review Spend settings before continuing." }; record.budgetDay = localDay(); return true;
     }
+    const workerToken = workerCredentialProblem(this.config);
+    if (workerToken) { record.decision = { kind: "human", title: "Fix the worker GitHub token", reason: `${workerToken}. The saved run will resume once workers can start with their own token.` }; return true; }
     try {
       this.admitted(); await this.runner.resume(job, recovery.instructions ?? "The local worker was interrupted. Recheck GitHub and continue the original task in this checkout. Preserve all existing edits and do not repeat publication already confirmed on GitHub.");
       recovery.retryAt = undefined;
@@ -557,7 +566,7 @@ export class Controller {
       record.assessment = undefined;
       return true;
     }
-    if (!record.assessment && record.decision.kind === "human" && (modeOf(this.config) === "auto" || record.job)) await this.queueAssessment(record, record.decision.reason);
+    if (!record.assessment && record.decision.kind === "human" && (modeOf(this.config) === "auto" || record.job) && !workerCredentialProblem(this.config)) await this.queueAssessment(record, record.decision.reason);
     const assessment = record.assessment;
     if (!assessment) return false;
     assessment.id ??= randomUUID();
