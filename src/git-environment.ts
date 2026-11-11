@@ -1,10 +1,14 @@
-export function gitEnvironment(signingKey?: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+// Workers get only the token in their own environment, never the controller's gh login.
+const workerCredentialHelper = `!f() { test "$1" = get || exit 0; test -n "$GH_TOKEN" || exit 1; printf 'username=x-access-token\\npassword=%s\\n' "$GH_TOKEN"; }; f`;
+
+export function gitEnvironment(signingKey?: string, base: NodeJS.ProcessEnv = process.env, credentials: "controller" | "worker" = "controller"): NodeJS.ProcessEnv {
   const env = { ...base };
   const entries: [string, string][] = [
     ["url.https://github.com/.insteadOf", "git@github.com:"],
     ["url.https://github.com/.insteadOf", "ssh://git@github.com/"],
+    ...(credentials === "worker" ? [["credential.helper", ""] as [string, string]] : []),
     ["credential.https://github.com.helper", ""],
-    ["credential.https://github.com.helper", "!gh auth git-credential"],
+    ["credential.https://github.com.helper", credentials === "worker" ? workerCredentialHelper : "!gh auth git-credential"],
     ["credential.interactive", "false"],
   ];
   if (signingKey) entries.push(
@@ -19,7 +23,7 @@ export function gitEnvironment(signingKey?: string, base: NodeJS.ProcessEnv = pr
   return env;
 }
 
-export function gitShellSettings(signingKey?: string): { [key: string]: string } {
-  const env = gitEnvironment(signingKey, {});
+export function gitShellSettings(signingKey?: string, credentials: "controller" | "worker" = "controller"): { [key: string]: string } {
+  const env = gitEnvironment(signingKey, {}, credentials);
   return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }

@@ -2,6 +2,7 @@ import { join, resolve } from "node:path";
 import { Store } from "../src/store";
 import { command } from "../src/command";
 import type { WorkerConfig, WorkerState } from "../src/worker";
+import { workerCommand } from "../src/worker-credentials";
 
 const root = resolve(import.meta.dir, "..");
 const config = await Bun.file(join(root, "woodshed.config.json")).json();
@@ -23,7 +24,7 @@ for (const number of process.argv.slice(2).map(Number)) {
   const prompt = previous.prompt.replace(/If ordinary git publishing is permitted,[^\n]*/, "Do not stage, commit, or push. Woodshed validates, signs, and publishes your declared changed files.")
     .replace('"outcome":"published"|"needs_human"|"superseded","reason":', '"outcome":"ready_to_publish"|"needs_human"|"superseded","files":["exact/relative/changed/file"],"reason":');
   await Bun.write(path, JSON.stringify({ ...previous, prompt, gitSigningKey: config.gitSigningKey, resumeThreadId: run.threadId, resumeQueued: true }));
-  await command(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", previous.checkout, process.execPath, join(root, "src/worker.ts"), path]);
+  await command(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", previous.checkout, ...workerCommand(config, directory, [process.execPath, join(root, "src/worker.ts"), path])]);
   let ready = false;
   for (let i = 0; i < 100; i++) {
     await Bun.sleep(200);

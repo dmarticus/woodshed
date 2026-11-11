@@ -31,6 +31,6 @@ async function main(): Promise<void> {
   await Bun.write(join(directory, "woodshed.service"), headlessUnit(root, process.execPath, homedir()));
   await command(["systemctl", "--user", "daemon-reload"]);
   await command(["systemctl", "--user", "enable", "--now", "woodshed.service"]);
-  console.log("Woodshed headless service installed in Watch mode. Complete GitHub, Codex, signing, and the Mac connection before enabling Auto.");
+  console.log("Woodshed headless service installed in Watch mode. Complete GitHub, Codex, signing, the worker token (bun scripts/setup-worker-token.ts), and the Mac connection before enabling Auto.");
 }
 if (import.meta.main) await main();
