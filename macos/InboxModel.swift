@@ -180,7 +180,8 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         return record.assessment?.result?.route == "ask" || record.job != nil && lastRun(record)?.prompt?.kind == "question"
     }
     var notificationBroken: Bool { notificationPermission == "denied" && (notifyNeeds || notifyReady || notifyFinished) }
-    var attentionCount: Int { attention.count + (notificationBroken ? 1 : 0) }
+    var controllerWarnings: [ControllerWarning] { connected ? state?.health?.warnings ?? [] : [] }
+    var attentionCount: Int { attention.count + (notificationBroken ? 1 : 0) + controllerWarnings.count }
     var status: String {
         if !connected { return state == nil ? "Connecting…" : "Controller unavailable" }
         if preview || state?.demo == true { return "Preview" }

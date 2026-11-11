@@ -78,3 +78,22 @@ test("Watch stays Watch and cancellation leaves old controller running", async (
   await expect(deploy(f.ops, commit)).rejects.toThrow("interrupted");
   expect(f.calls).toEqual([]); expect(f.mode()).toBe("watch");
 });
+
+test("rolls back a release that drops an integration the running controller had", async () => {
+  const f = fixture(); const state = f.ops.state;
+  f.ops.state = async () => { const s = await state(); return { ...s, health: { ...s.health, routingCheck: { state: f.deployed() ? "off" : "ok" }, analytics: { enabled: true } } }; };
+  await expect(deploy(f.ops, commit)).rejects.toThrow("lost configured integrations: typesafe");
+  expect(f.calls).toContain("rollback"); expect(f.deployed()).toBe(false);
+});
+
+test("rolls back a release that reports a missing required integration, but not a transient failure", async () => {
+  const f = fixture(); const state = f.ops.state;
+  let warnings = [{ id: "typesafe-failing", message: "Jev routing check failed 3 times in a row" }];
+  f.ops.state = async () => { const s = await state(); return { ...s, health: { ...s.health, warnings } }; };
+  await deploy(f.ops, commit); expect(f.deployed()).toBe(true);
+  const g = fixture(); const gState = g.ops.state;
+  warnings = [{ id: "typesafe-missing", message: "Jev routing check is off" }];
+  g.ops.state = async () => { const s = await gState(); return { ...s, health: { ...s.health, warnings: g.deployed() ? warnings : [] } }; };
+  await expect(deploy(g.ops, commit)).rejects.toThrow("missing required integrations");
+  expect(g.deployed()).toBe(false);
+});

@@ -6,7 +6,15 @@ import { command } from "../src/command";
 import { defaultTokenPath } from "../src/connection";
 import type { Mode } from "../src/model";
 
-type State = { mode: Mode; syncing: boolean; prs: { job?: unknown }[]; health: { activeRuns: number; build?: { commit: string } } };
+type State = { mode: Mode; syncing: boolean; prs: { job?: unknown }[]; health: { activeRuns: number; build?: { commit: string }; routingCheck?: { state: string }; analytics?: { enabled: boolean }; warnings?: { id: string; message: string }[] } };
+
+// Older controllers don't report routingCheck, so an unknown state never counts as lost.
+function integrations(health: State["health"]): Set<string> {
+  const enabled = new Set<string>();
+  if (health.routingCheck && health.routingCheck.state !== "off") enabled.add("typesafe");
+  if (health.analytics?.enabled) enabled.add("posthog");
+  return enabled;
+}
 export type Deployment = {
   state(): Promise<State>; mode(mode: Mode): Promise<void>;
   stop(): Promise<void>; backup(): Promise<void>; activate(): Promise<void>;
@@ -16,7 +24,9 @@ export type Deployment = {
 
 // All waits happen before stopping the controller. A failed release returns to the previous code.
 export async function deploy(ops: Deployment, commit: string, drainMS = 20 * 60_000, healthMS = 60_000): Promise<void> {
-  const original = (await ops.state()).mode;
+  const initial = await ops.state();
+  const original = initial.mode;
+  const before = integrations(initial.health);
   let stopped = false;
   const checkAbort = () => { if (ops.aborted()) throw Error("Deployment interrupted"); };
   try {
@@ -39,7 +49,15 @@ export async function deploy(ops: Deployment, commit: string, drainMS = 20 * 60_
     const healthDeadline = ops.now() + healthMS;
     while (true) {
       checkAbort();
-      try { if ((await ops.state()).health.build?.commit === commit) break; } catch {}
+      const health = await ops.state().then(state => state.health, () => undefined);
+      if (health?.build?.commit === commit) {
+        // A release must not silently drop an integration the running controller had, e.g. a lost .env.local.
+        const lost = [...before].filter(name => !integrations(health).has(name));
+        if (lost.length) throw Error(`New controller lost configured integrations: ${lost.join(", ")}`);
+        const missing = health.warnings?.filter(w => w.id.endsWith("-missing")) ?? [];
+        if (missing.length) throw Error(`New controller is missing required integrations: ${missing.map(w => w.message).join("; ")}`);
+        break;
+      }
       if (ops.now() >= healthDeadline) throw Error("New controller did not become healthy on the expected commit");
       await ops.wait();
     }

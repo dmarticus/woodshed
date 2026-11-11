@@ -8,7 +8,7 @@ import { Runner } from "./runner";
 import { Store } from "./store";
 import { assessmentKey } from "./triage";
 import { bindDecision, sameQuestion, remainingRepairDecision } from "./decisions";
-import { checkWithJev } from "./jev";
+import { checkWithJev, RoutingCheckHealth } from "./jev";
 import { recoveryDelay, temporaryFailure, type Recovery } from "./recovery";
 import { handoffSchema, type Handoff } from "./handoff";
 import { stackBlock, stackOrder } from "./stack";
@@ -39,7 +39,16 @@ export class Controller {
   sleeping = false;
   health() {
     const records = this.store.all();
-    return { build: buildInfo, scheduler: { ...this.capacity(), mode: this.config.concurrencyMode ?? "fixed", cpuTargetPercent: this.config.cpuTargetPercent ?? 80, memoryTargetPercent: this.config.memoryTargetPercent ?? 80, configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => !mergeQueueDecision(r) && (r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting")).length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null } };
+    return { build: buildInfo, scheduler: { ...this.capacity(), mode: this.config.concurrencyMode ?? "fixed", cpuTargetPercent: this.config.cpuTargetPercent ?? 80, memoryTargetPercent: this.config.memoryTargetPercent ?? 80, configured: this.config.maxConcurrentJobs }, remote: process.env.WOODSHED_REMOTE === "1", lastPoll: this.lastSync, lastContact: this.lastContact, queueDepth: records.filter(r => !mergeQueueDecision(r) && (r.decision.kind === "fix" || r.assessment && !r.assessment.result || r.recovery?.retryAt && r.decision.kind === "waiting")).length, activeRuns: this.activeSlots(), githubError: this.github.authenticationError ?? null, lastSleep: this.lastSleep, resumedAt: this.resumedAt, sleeping: this.sleeping, analytics: this.analytics?.status() ?? { enabled: false, queued: 0, quarantined: 0, lastError: null }, routingCheck: this.routing.status(), warnings: this.warnings() };
+  }
+  readonly routing: RoutingCheckHealth;
+  warnings(): { id: string; message: string }[] {
+    const warnings: { id: string; message: string }[] = [];
+    const routing = this.routing.status();
+    if (routing.state === "off" && routing.required) warnings.push({ id: "typesafe-missing", message: "Jev routing check is off: TYPESAFE_API_KEY is not set on the controller" });
+    if (routing.state === "failing") warnings.push({ id: "typesafe-failing", message: `Jev routing check failed ${routing.consecutiveFailures} times in a row${routing.lastError ? `: ${routing.lastError}` : ""}` });
+    if (this.config.requiredIntegrations?.includes("posthog") && !this.analytics?.status().enabled) warnings.push({ id: "posthog-missing", message: "Product analytics is off: POSTHOG_PROJECT_TOKEN is not set on the controller" });
+    return warnings;
   }
   power(event: "sleep" | "wake", confirmed = true): void {
     if (process.env.WOODSHED_REMOTE === "1" && confirmed) return;
@@ -84,6 +93,7 @@ export class Controller {
   readonly playbooks: Playbooks;
   readonly telemetry?: ProductAnalytics;
   constructor(readonly config: Config, readonly store: Store, readonly github: GitHub, readonly runner: Runner, readonly now: () => number = Date.now, readonly analytics?: Analytics, readonly resources: (configured: number, policy?: CapacityPolicy) => WorkerCapacity = workerCapacity, decisionRepository: DecisionRepository = github) {
+    this.routing = new RoutingCheckHealth(config.requiredIntegrations?.includes("typesafe") ?? false, undefined, now);
     this.outcomes = new Outcomes(store, config, () => github.viewerName, now);
     this.decisions = new MergedDecisions(store, config, decisionRepository, () => github.viewerName, now);
     store.localHistory = { record: r => { this.outcomes.record(r); this.decisions.observe(r); }, run: r => this.outcomes.run(r), audit: (kind, number, data) => this.outcomes.audit(kind, number, data) };
@@ -288,11 +298,13 @@ export class Controller {
           this.outcomes.triage(record, result.assessment);
           this.store.audit("triage-outcome", snapshot.number, { assessmentId: record.assessment.id, head: snapshot.head, job: job.name, route: result.assessment.route, followups: record.assessment.followups });
           record.assessment.key = assessmentKey(snapshot);
-          if (!record.assessment.jevChecked && this.budgetAvailable() >= 0.01) {
+          if (!record.assessment.jevChecked && this.budgetAvailable() < 0.01) this.routing.skipped("daily budget exhausted");
+          else if (!record.assessment.jevChecked) {
             record.assessment.jevChecked = true;
             try {
               const verdict = await checkWithJev(snapshot, result.assessment);
               if (verdict) {
+                this.routing.succeeded();
                 this.store.audit("jev-verdict", snapshot.number, { head: snapshot.head, assessmentId: record.assessment.id, assessment: job.name, proposed: result.assessment.route, verdict, disagreement: verdict.choice !== result.assessment.route });
                 this.telemetry?.routingCheck(snapshot.number, `jev-${job.name}`, verdict.choice, verdict.confidence, verdict.choice !== result.assessment.route);
                 this.store.log(snapshot.number, `Jev routing: ${verdict.choice}; investigation: ${result.assessment.route}; confidence ${verdict.confidence.toFixed(2)}`);
@@ -303,7 +315,7 @@ export class Controller {
                   record.assessment.report += `\nIndependent routing check suggested ${verdict.choice}. Verify the disagreement against GitHub; preserve real operational/visual prerequisites. Previous investigation: ${JSON.stringify(result.assessment)}`;
                 }
               }
-            } catch { this.store.log(snapshot.number, "Optional TypeSafe routing check unavailable; using the GitHub investigation"); }
+            } catch (error) { this.routing.failed(error); this.store.log(snapshot.number, "Optional TypeSafe routing check unavailable; using the GitHub investigation"); }
           }
         }
       } else if (result.state === "decision-context") {

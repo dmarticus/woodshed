@@ -15,3 +15,22 @@ export async function checkWithJev(pr: Snapshot, result: AssessmentResult, key =
   if (!answer || answer.type !== "choice" || !["wait", "repair", "ask", "ready"].includes(answer.choice) || !Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !Number.isSafeInteger(data.usage?.input_tokens) || data.usage.input_tokens < 0 || data.model !== "jev-1.14.0") throw new Error("Invalid TypeSafe routing response");
   return { choice: answer.choice, confidence: answer.confidence, model: data.model, inputTokens: data.usage.input_tokens, costUSD: data.usage.input_tokens * 0.042 / 1_000_000 };
 }
+
+export type RoutingCheckStatus = { state: "off" | "idle" | "ok" | "failing"; required: boolean; lastSuccess: string | null; lastError: string | null; consecutiveFailures: number; lastSkipped: { at: string; reason: string } | null };
+const FAILING_AFTER = 3;
+
+// Jev is optional, so an absent key or a failing API used to degrade silently. This keeps that visible in /health.
+export class RoutingCheckHealth {
+  private lastSuccess: string | null = null;
+  private lastError: string | null = null;
+  private failures = 0;
+  private lastSkipped: RoutingCheckStatus["lastSkipped"] = null;
+  constructor(readonly required: boolean, private readonly configured = () => !!process.env.TYPESAFE_API_KEY, private readonly now = Date.now) {}
+  succeeded(): void { this.lastSuccess = new Date(this.now()).toISOString(); this.failures = 0; this.lastError = null; }
+  failed(error: unknown): void { this.failures++; this.lastError = (error instanceof Error ? error.message : String(error)).slice(0, 200); }
+  skipped(reason: string): void { this.lastSkipped = { at: new Date(this.now()).toISOString(), reason }; }
+  status(): RoutingCheckStatus {
+    const state = !this.configured() ? "off" : this.failures >= FAILING_AFTER ? "failing" : this.lastSuccess ? "ok" : "idle";
+    return { state, required: this.required, lastSuccess: this.lastSuccess, lastError: this.lastError, consecutiveFailures: this.failures, lastSkipped: this.lastSkipped };
+  }
+}

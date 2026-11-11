@@ -53,6 +53,8 @@ export type Config = {
   modelPrices?: { [model: string]: ModelPrice }; watchFilter?: "mine" | "mine-and-reviews" | "query"; watchQuery?: string;
   workerProtocol?: "app-server";
   gitSigningKey?: string;
+  // Integrations whose absence should warn in /health and block a deploy, instead of degrading silently.
+  requiredIntegrations?: ("typesafe" | "posthog")[];
 };
 
 export type Mode = "watch" | "auto" | "paused";

@@ -65,6 +65,9 @@ struct MenuContent: View {
                 }.padding(16)
             }
             GitHubConnectionBanner(model: model).padding(.horizontal, 12)
+            ForEach(model.controllerWarnings) { warning in
+                Label(warning.message, systemImage: "exclamationmark.triangle").font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 12).padding(.top, 12)
+            }
             if model.notificationBroken {
                 Button { Task { await model.enableNotifications() } } label: { Label("Notifications are off · Open settings", systemImage: "bell.badge").font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8)) }.buttonStyle(.plain).padding(12)
             }

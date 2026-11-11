@@ -5,7 +5,7 @@ import { decide, fingerprint, type AssessmentResult, type Config, type Snapshot 
 import { assessmentKey, parseAssessment } from "../src/triage";
 import { routeWithCIEvidence } from "../src/check-evidence";
 import { localDay } from "../src/usage";
-import { checkWithJev } from "../src/jev";
+import { checkWithJev, RoutingCheckHealth } from "../src/jev";
 
 const pr = (): Snapshot => ({ number: 42, title: "Fix export", url: "https://github.com/example/project/pull/42", head: "abc", branch: "feature", base: "main", state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: [{ name: "Tests", status: "COMPLETED", conclusion: "SUCCESS", url: "" }], threads: [], labels: [], reviews: [{ author: "reviewer", state: "APPROVED", body: "Reviewed", head: "abc", submittedAt: "" }] });
 const answer = (route: AssessmentResult["route"] = "ask"): AssessmentResult => ({ head: "abc", route, category: "operations", title: "Confirm the prerequisite", reason: "This change depends on an operational step.", question: "Confirm the prerequisite was completed in both regions.", instructions: "Verify the intended repair and declare its changed files.", evidence: [{ url: "https://github.com/example/project/issues/40", detail: "The issue requires the step before deployment." }] });
@@ -342,4 +342,18 @@ test("triage finding metadata stays backward compatible and validates optional c
   expect(parseAssessment({ ...base, review_threads: [{ ...base.review_threads[0], category: "error_handling", code_url: `https://github.com/example/project/blob/${head}/src/api.py` }] }, head, undefined, "example/project").review_threads?.[0]?.category).toBe("error_handling");
   expect(() => parseAssessment({ ...base, review_threads: [{ ...base.review_threads[0], category: "invented" }] }, head)).toThrow();
   expect(() => parseAssessment({ ...base, review_threads: [{ ...base.review_threads[0], code_url: `https://github.com/other/project/blob/${head}/src/api.py` }] }, head, undefined, "example/project")).toThrow();
+});
+
+test("routing check health reports off, idle, ok and failing so a missing key or broken API is visible", () => {
+  let key = false; let time = 0;
+  const health = new RoutingCheckHealth(true, () => key, () => time);
+  expect(health.status()).toMatchObject({ state: "off", required: true });
+  key = true; expect(health.status().state).toBe("idle");
+  health.succeeded(); expect(health.status()).toMatchObject({ state: "ok", lastSuccess: new Date(0).toISOString() });
+  for (let i = 0; i < 2; i++) health.failed(new Error("TypeSafe returned HTTP 500"));
+  expect(health.status().state).toBe("ok");
+  health.failed(new Error("TypeSafe returned HTTP 500"));
+  expect(health.status()).toMatchObject({ state: "failing", consecutiveFailures: 3, lastError: "TypeSafe returned HTTP 500" });
+  time = 1000; health.skipped("daily budget exhausted"); health.succeeded();
+  expect(health.status()).toMatchObject({ state: "ok", consecutiveFailures: 0, lastSkipped: { reason: "daily budget exhausted" } });
 });

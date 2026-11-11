@@ -67,6 +67,11 @@ struct ControllerHealth: Decodable, Sendable {
     let lastSleep: String?
     let resumedAt: String?
     let sleeping: Bool
+    let warnings: [ControllerWarning]?
+}
+struct ControllerWarning: Decodable, Sendable, Identifiable {
+    let id: String
+    let message: String
 }
 struct InboxState: Decodable, Sendable {
     let repository: String
