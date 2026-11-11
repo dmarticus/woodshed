@@ -1,6 +1,7 @@
 import { MergedDecisions, type DecisionRepository } from "./merged-decisions";
 import { Outcomes, repositoryPath } from "./outcomes";
 import { randomUUID } from "node:crypto";
+import { statfsSync } from "node:fs";
 import { approvalRequestState, hasRequestedApproval, stamphogRefused, decide, fingerprint, modeOf, repairResolved, failed, type Config, type Record, type Snapshot, type Job, type Run } from "./model";
 import { localDay } from "./usage";
 import { GitHub } from "./github";
@@ -48,6 +49,10 @@ export class Controller {
     if (routing.state === "off" && routing.required) warnings.push({ id: "typesafe-missing", message: "Jev routing check is off: TYPESAFE_API_KEY is not set on the controller" });
     if (routing.state === "failing") warnings.push({ id: "typesafe-failing", message: `Jev routing check failed ${routing.consecutiveFailures} times in a row${routing.lastError ? `: ${routing.lastError}` : ""}` });
     if (this.config.requiredIntegrations?.includes("posthog") && !this.analytics?.status().enabled) warnings.push({ id: "posthog-missing", message: "Product analytics is off: POSTHOG_PROJECT_TOKEN is not set on the controller" });
+    const herdr = this.runner.herdr;
+    if (herdr && herdr.consecutiveFailures >= 3) warnings.push({ id: "herdr-failing", message: `Herdr has failed ${herdr.consecutiveFailures} commands in a row since ${herdr.failingSince}, so runs cannot be checked or started. Run \`hc server restart\` on the controller host${herdr.lastError ? `. Last error: ${herdr.lastError}` : ""}` });
+    const disk = diskUsage(this.runner.dataDir);
+    if (disk && disk.usedPercent >= 80) warnings.push({ id: "disk-low", message: `Controller disk is ${disk.usedPercent}% full (${disk.freeGB} GB free). Runs, herdr, and deploys fail when it fills` });
     return warnings;
   }
   power(event: "sleep" | "wake", confirmed = true): void {
@@ -1069,4 +1074,13 @@ export class Controller {
     } finally { this.budgetChecking = false; }
     if (freedSlot) void this.sync();
   }
+}
+
+export function diskUsage(path: string | undefined, stat = statfsSync): { usedPercent: number; freeGB: number } | undefined {
+  if (!path) return;
+  try {
+    const disk = stat(path);
+    const used = disk.blocks - disk.bfree;
+    return { usedPercent: Math.ceil(100 * used / (used + disk.bavail)), freeGB: Math.round(disk.bavail * disk.bsize / 1e9) };
+  } catch { return; }
 }

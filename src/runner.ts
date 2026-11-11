@@ -36,7 +36,21 @@ export class Runner {
     job.decisionContextAfterTurn = turns; job.contextReview = true;
     return `The exact proposed file manifest has additional merged-tradeoff evidence that was not supplied before this repair. Review it and reconsider the saved edits before publication. Preserve unrelated work. Return the complete exact file manifest again, including preserved intended edits. Do not publish or expand scope.\n${mergedDecisionContext(unseen, context.omitted_records)}`;
   }
-  constructor(readonly config: Config, readonly dataDir: string, readonly exec: typeof command = command) { this.models = new Models(config); }
+  readonly exec: typeof command;
+  // herdr can stay up while every command fails (its registry writer stops when the disk fills), so count consecutive failures.
+  readonly herdr: { consecutiveFailures: number; failingSince?: string; lastError?: string } = { consecutiveFailures: 0 };
+  constructor(readonly config: Config, readonly dataDir: string, exec: typeof command = command) {
+    this.models = new Models(config);
+    this.exec = async (argv, options) => {
+      if (argv[0] !== "hc") return exec(argv, options);
+      try { const output = await exec(argv, options); this.herdr.consecutiveFailures = 0; this.herdr.failingSince = undefined; return output; }
+      catch (error) {
+        if (missingSession(error)) { this.herdr.consecutiveFailures = 0; this.herdr.failingSince = undefined; }
+        else { this.herdr.consecutiveFailures++; this.herdr.failingSince ??= new Date().toISOString(); this.herdr.lastError = String((error as Error)?.message ?? error).slice(0, 200); }
+        throw error;
+      }
+    };
+  }
   private async guardMergeQueue(current: Snapshot): Promise<void> {
     if (!current.mergeQueue) return;
     const queue = await new GitHub(this.config, this.exec).mergeQueue(current);
