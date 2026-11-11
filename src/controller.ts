@@ -8,7 +8,7 @@ import { Runner } from "./runner";
 import { Store } from "./store";
 import { assessmentKey } from "./triage";
 import { bindDecision, sameQuestion, remainingRepairDecision } from "./decisions";
-import { checkWithJev, RoutingCheckHealth } from "./jev";
+import { checkWithJev, routeBeforeInvestigation, RoutingCheckHealth, wouldSkipInvestigation } from "./jev";
 import { recoveryDelay, temporaryFailure, type Recovery } from "./recovery";
 import { handoffSchema, type Handoff } from "./handoff";
 import { stackBlock, stackOrder } from "./stack";
@@ -705,6 +705,7 @@ export class Controller {
     const job: Job = { name: `ws-triage-${pr.number}-${randomUUID().slice(0, 8)}`, head: pr.head, fingerprint: record.fingerprint, startedAt: new Date().toISOString(), kind: "triage", model: this.config.defaultModel, budgetUSD: budget, adapter: "app-server" };
     this.admitted(); record.job = job; assessment.attempts++;
     this.store.put(record); this.store.saveRun(this.initialRun(job, pr.number));
+    void this.shadowRoute(pr, job, assessment.id, assessment.report);
     try {
       job.ciEvidence = assessment.ciEvidence?.head === pr.head ? assessment.ciEvidence : await this.github.failureEvidence?.(pr);
       this.store.put(record);
@@ -716,6 +717,17 @@ export class Controller {
       record.job = undefined;
     }
     return true;
+  }
+  // Records what Jev would route before the investigation runs; never changes the investigation itself.
+  private async shadowRoute(pr: Snapshot, job: Job, assessmentId: string | undefined, report: string): Promise<void> {
+    try {
+      const verdict = await routeBeforeInvestigation(pr, report);
+      if (!verdict) return;
+      this.routing.succeeded();
+      this.store.audit("jev-shadow", pr.number, { head: pr.head, assessmentId, job: job.name, choice: verdict.choice, confidence: verdict.confidence, unresolvedThreads: pr.threads.length, wouldSkip: wouldSkipInvestigation(pr, verdict), costUSD: verdict.costUSD });
+      const now = new Date().toISOString();
+      this.store.saveRun({ id: `jev-shadow-${job.name}`, number: pr.number, startedAt: now, endedAt: now, state: "succeeded", model: verdict.model, turns: 1, costUSD: verdict.costUSD, costsByDay: { [localDay()]: verdict.costUSD }, summary: `Shadow routing: ${verdict.choice} (${verdict.confidence.toFixed(2)})` });
+    } catch (error) { this.routing.failed(error); }
   }
   private async requestStamphog(record: Record, expectedHead: string): Promise<boolean> {
     const current = await this.github.snapshot(record.snapshot.number);

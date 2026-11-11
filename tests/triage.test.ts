@@ -5,7 +5,9 @@ import { decide, fingerprint, type AssessmentResult, type Config, type Snapshot 
 import { assessmentKey, parseAssessment } from "../src/triage";
 import { routeWithCIEvidence } from "../src/check-evidence";
 import { localDay } from "../src/usage";
-import { checkWithJev, RoutingCheckHealth } from "../src/jev";
+import { checkWithJev, routeBeforeInvestigation, RoutingCheckHealth, wouldSkipInvestigation } from "../src/jev";
+import { Database } from "bun:sqlite";
+import { shadowReport } from "../scripts/jev-shadow-report";
 
 const pr = (): Snapshot => ({ number: 42, title: "Fix export", url: "https://github.com/example/project/pull/42", head: "abc", branch: "feature", base: "main", state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: [{ name: "Tests", status: "COMPLETED", conclusion: "SUCCESS", url: "" }], threads: [], labels: [], reviews: [{ author: "reviewer", state: "APPROVED", body: "Reviewed", head: "abc", submittedAt: "" }] });
 const answer = (route: AssessmentResult["route"] = "ask"): AssessmentResult => ({ head: "abc", route, category: "operations", title: "Confirm the prerequisite", reason: "This change depends on an operational step.", question: "Confirm the prerequisite was completed in both regions.", instructions: "Verify the intended repair and declare its changed files.", evidence: [{ url: "https://github.com/example/project/issues/40", detail: "The issue requires the step before deployment." }] });
@@ -356,4 +358,30 @@ test("routing check health reports off, idle, ok and failing so a missing key or
   expect(health.status()).toMatchObject({ state: "failing", consecutiveFailures: 3, lastError: "TypeSafe returned HTTP 500" });
   time = 1000; health.skipped("daily budget exhausted"); health.succeeded();
   expect(health.status()).toMatchObject({ state: "ok", consecutiveFailures: 0, lastSkipped: { reason: "daily budget exhausted" } });
+});
+
+test("shadow routing sends the agent report instead of an investigation and only skips confident thread-free waits", async () => {
+  let body: any;
+  const request: any = async (_url: string, init: RequestInit) => { body = JSON.parse(init.body as string); return Response.json({ model: "jev-1.14.0", answers: { route: { type: "choice", choice: "wait", confidence: 0.95 } }, usage: { input_tokens: 400 } }); };
+  const verdict = (await routeBeforeInvestigation(pr(), "x".repeat(5000), "fixture-key", request))!;
+  expect(body.state.investigation).toBeUndefined(); expect(body.state.report).toHaveLength(4000);
+  expect(wouldSkipInvestigation({ ...pr(), threads: [] }, verdict)).toBe(true);
+  expect(wouldSkipInvestigation({ ...pr(), threads: [{} as any] }, verdict)).toBe(false);
+  expect(wouldSkipInvestigation({ ...pr(), threads: [] }, { ...verdict, confidence: 0.89 })).toBe(false);
+  expect(wouldSkipInvestigation({ ...pr(), threads: [] }, { ...verdict, choice: "ask" })).toBe(false);
+  expect(await routeBeforeInvestigation(pr(), "report", "", request)).toBeUndefined();
+});
+
+test("shadow report compares verdicts with investigations and separates safe from unsafe skips", () => {
+  const db = new Database(":memory:");
+  db.exec("CREATE TABLE audits (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, number INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL); CREATE TABLE runs (id TEXT PRIMARY KEY, number INTEGER NOT NULL, started TEXT NOT NULL, data TEXT NOT NULL)");
+  const audit = (kind: string, data: object) => db.query("INSERT INTO audits (time, number, kind, data) VALUES ('2026-11-10T00:00:00Z', 7, ?, ?)").run(kind, JSON.stringify(data));
+  for (const [job, choice, wouldSkip, route] of [["ws-triage-a", "wait", true, "wait"], ["ws-triage-b", "wait", true, "repair"], ["ws-triage-c", "repair", false, "repair"], ["ws-triage-d", "wait", true, undefined]] as const) {
+    audit("jev-shadow", { job, choice, confidence: 0.95, wouldSkip, costUSD: 0.001 });
+    if (route) audit("triage-outcome", { job, route });
+    db.query("INSERT INTO runs VALUES (?, 7, '2026-11-10T00:00:00Z', ?)").run(job, JSON.stringify({ costUSD: 0.1 }));
+  }
+  const report = shadowReport(db, "2026-11-01T00:00:00Z");
+  expect(report).toMatchObject({ compared: 3, pending: 1, matrix: { wait: { wait: 1, repair: 1 }, repair: { repair: 1 } }, skips: { total: 2, safe: 1, unsafe: [{ job: "ws-triage-b", investigation: "repair" }] } });
+  expect(report.investigationUSD.avoidable).toBeCloseTo(0.1); expect(report.jevUSD).toBeCloseTo(0.004);
 });
