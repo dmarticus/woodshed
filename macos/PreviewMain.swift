@@ -19,7 +19,7 @@ struct NativePreview {
         let size: NSSize
         switch mode {
         case "composer": content = AnyView(RunComposerPreview(model: model)); size = NSSize(width: width, height: 210)
-        case "menu": content = AnyView(MenuContent(model: model)); size = NSSize(width: 370, height: 600)
+        case "menu": content = AnyView(MenuContent(model: model)); size = NSSize(width: 340, height: 600)
         case "main", "busy", "bulk", "activity": content = AnyView(MainView(model: model)); size = NSSize(width: width, height: 650)
         case "sidebar": content = AnyView(PRSidebar(model: model)); size = NSSize(width: 260, height: 650)
         case "settings", "automation", "notifications", "spend": model.settingsTab = mode == "settings" ? "general" : mode; content = AnyView(SettingsView(model: model)); size = NSSize(width: 540, height: 560)
@@ -30,7 +30,7 @@ struct NativePreview {
         if ["settings", "automation", "notifications", "spend"].contains(mode) { model.configureSettingsToolbar(window) }
         window.minSize = .zero
         window.appearance = NSAppearance(named: args.last == "dark" ? .darkAqua : .aqua)
-        if mode == "menu", let view = window.contentView { view.layoutSubtreeIfNeeded(); window.setContentSize(NSSize(width: 370, height: view.fittingSize.height)) }
+        if mode == "menu", let view = window.contentView { view.layoutSubtreeIfNeeded(); window.setContentSize(NSSize(width: 340, height: view.fittingSize.height)) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
             // Layer-backed toolbar materials do not reliably render through cacheDisplay.
             // Prefer a WindowServer capture so the preview matches what is on screen.

@@ -53,92 +53,78 @@ struct GitHubConnectionBanner: View {
 }
 struct MenuContent: View {
     @ObservedObject var model: InboxModel
+    private var quiet: Bool { model.attention.isEmpty && model.running.isEmpty && model.ready.isEmpty }
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack { Text("Woodshed").font(.headline); Spacer(); if model.connected { ModePicker(model: model) } else { Label("Disconnected", systemImage: "wifi.slash").font(.caption).foregroundStyle(.secondary) } }.padding(16)
+        VStack(spacing: 0) {
+            MenuHeader(model: model)
             Divider()
             if !model.connected {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(model.connectionSummary).font(.callout)
-                    if let error = model.connectionError { Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
-                    Button("Reconnect") { Task { await model.refresh() } }.buttonStyle(.borderedProminent)
-                }.padding(16)
+                VStack(spacing: 10) {
+                    Image(systemName: "wifi.slash").font(.system(size: 22, weight: .light)).foregroundStyle(.secondary)
+                    Text(model.connectionSummary).font(.callout).multilineTextAlignment(.center)
+                    if let error = model.connectionError { Text(error).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).lineLimit(2) }
+                    Button("Reconnect") { Task { await model.refresh() } }.buttonStyle(.borderedProminent).controlSize(.small)
+                }.frame(maxWidth: .infinity).padding(.horizontal, 24).padding(.vertical, 22)
+            } else {
+                ScrollView { list }.scrollBounceBehavior(.basedOnSize).frame(maxHeight: 460)
             }
-            GitHubConnectionBanner(model: model).padding(.horizontal, 12)
-            ForEach(model.controllerWarnings) { warning in
-                Label(warning.message, systemImage: "exclamationmark.triangle").font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 12).padding(.top, 12)
-            }
-            if model.notificationBroken {
-                Button { Task { await model.enableNotifications() } } label: { Label("Notifications are off · Open settings", systemImage: "bell.badge").font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8)) }.buttonStyle(.plain).padding(12)
-            }
-            if !model.attention.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Needs you").font(.caption).foregroundStyle(.secondary)
-                    ForEach(model.attention) { record in
-                        Button { model.showMain(record.id) } label: {
-                            HStack(alignment: .top, spacing: 9) {
-                                Circle().fill(.orange).frame(width: 7, height: 7).padding(.top, 5)
-                                VStack(alignment: .leading, spacing: 3) { Text(record.displayTitle).lineLimit(2); Text(record.decision.title ?? record.decision.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2) }.frame(maxWidth: .infinity, alignment: .leading)
-                            }.padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                        }.buttonStyle(.plain).contextMenu { prContextMenu(record) }
-                    }
-                }.padding(12)
-            }
-            if !model.running.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(model.mode == .paused ? "\(model.running.count) finishing · nothing new will start" : "Running").font(.caption).foregroundStyle(.secondary)
-                    ForEach(model.running) { record in
-                        Button { model.showMain(record.id) } label: {
-                            HStack(spacing: 9) { ProgressView().controlSize(.mini); Text(record.displayTitle).lineLimit(1); Spacer(minLength: 6); Text(model.prSpend(record)).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading)
-                        }.buttonStyle(.plain).contextMenu { prContextMenu(record) }
-                    }
-                }.padding(12)
-            }
-            if !model.draftPRs.isEmpty {
-                Fold("\(model.draftPRs.count) drafts") {
-                    VStack(alignment: .leading, spacing: 9) {
-                        ForEach(model.draftPRs) { record in
-                            Button { model.showMain(record.id) } label: { Label(record.displayTitle, systemImage: "doc.text").lineLimit(1) }
-                                .buttonStyle(.plain).contextMenu { prContextMenu(record) }
-                        }
-                    }
-                }.padding(12)
-            }
-            if !model.mergeQueuePRs.isEmpty { statusGroup("\(model.mergeQueuePRs.count) in merge queue", records: model.mergeQueuePRs, icon: "arrow.triangle.merge") }
-            if !model.queued.isEmpty { statusGroup("\(model.queued.count) queued", records: model.queued, icon: "tray") }
-            if !model.waiting.isEmpty { statusGroup("\(model.waiting.count) waiting", records: model.waiting, icon: "clock") }
-            if !model.pausedPRs.isEmpty { statusGroup("\(model.pausedPRs.count) paused", records: model.pausedPRs, icon: "pause.circle") }
-            if !model.ready.isEmpty {
-                VStack(alignment: .leading, spacing: 9) {
-                    Text("Ready to merge").font(.caption).foregroundStyle(.secondary)
-                    ForEach(model.ready) { record in Button { model.showMain(record.id) } label: { Label(record.displayTitle, systemImage: "checkmark.circle.fill").foregroundStyle(.green).lineLimit(1) }.buttonStyle(.plain).contextMenu { prContextMenu(record) } }
-                }.padding(12)
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 12) {
-                Text(model.spendFooter).font(.caption).foregroundStyle(.secondary).opacity(model.connected ? 1 : 0.4)
-                Button("Open Woodshed") { model.showMain() }.buttonStyle(.plain).keyboardShortcut("o")
-                Button("Settings…") { model.showSettings() }.buttonStyle(.plain).keyboardShortcut(",")
-                Button("Quit Woodshed") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).keyboardShortcut("q")
-            }.padding(16)
-        }.frame(width: 370).background(Color(nsColor: .windowBackgroundColor))
+            if !model.connected { Divider() }
+            MenuFooter(model: model)
+        }
+        .frame(width: 340)
     }
-    private func statusGroup(_ title: String, records: [PullRequestRecord], icon: String) -> some View {
-        Fold(title) {
-            VStack(alignment: .leading, spacing: 12) {
+    @ViewBuilder private var list: some View {
+        VStack(spacing: 0) {
+            if let message = model.githubConnectionIssue {
+                MenuNotice(icon: "person.crop.circle.badge.exclamationmark", text: message, action: "Reconnect GitHub") { model.reconnectGitHub() }
+            }
+            ForEach(model.controllerWarnings) { MenuNotice(icon: "exclamationmark.triangle.fill", text: $0.message) }
+            if model.notificationBroken {
+                MenuNotice(icon: "bell.slash", text: "Notifications are off", action: "Open settings") { Task { await model.enableNotifications() } }
+            }
+            ForEach(model.attention) { record in
+                MenuRow(title: record.displayTitle, detail: record.decision.title ?? record.decision.reason, number: record.id, accent: .orange) {
+                    Circle().fill(.orange).frame(width: 8, height: 8).shadow(color: .orange.opacity(0.5), radius: 3, y: 1)
+                } open: { model.showMain(record.id) }.contextMenu { prContextMenu(record) }
+            }
+            ForEach(model.running) { record in
+                MenuRow(title: record.displayTitle, detail: model.listStatus(record) ?? "Working", number: record.id, trailing: model.prSpend(record)) {
+                    ProgressView().controlSize(.mini)
+                } open: { model.showMain(record.id) }.contextMenu { prContextMenu(record) }
+            }
+            ForEach(model.ready) { record in
+                MenuRow(title: record.displayTitle, detail: "Ready to merge", number: record.id) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                } open: { model.showMain(record.id) }.contextMenu { prContextMenu(record) }
+            }
+            if quiet {
+                VStack(spacing: 6) {
+                    Image(systemName: "hammer").font(.system(size: 20, weight: .light)).foregroundStyle(.tertiary)
+                    Text("All quiet in the woodshed").font(.callout.weight(.medium))
+                    Text(model.mode == .paused ? "Paused. Nothing new will start." : "Nothing needs you right now.").font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity).padding(.vertical, 18)
+                if !(model.mergeQueuePRs.isEmpty && model.queued.isEmpty && model.waiting.isEmpty && model.pausedPRs.isEmpty && model.draftPRs.isEmpty) { MenuDivider() }
+            }
+            group("In merge queue", records: model.mergeQueuePRs, icon: "arrow.triangle.merge")
+            group("Queued", records: model.queued, icon: "tray")
+            group("Waiting", records: model.waiting, icon: "clock")
+            group("Paused", records: model.pausedPRs, icon: "pause.circle")
+            group("Drafts", records: model.draftPRs, icon: "doc.text")
+        }
+    }
+    @ViewBuilder private func group(_ title: String, records: [PullRequestRecord], icon: String) -> some View {
+        if !records.isEmpty {
+            MenuGroup(title: title, count: records.count, icon: icon) {
                 ForEach(records) { record in
                     Button { model.showMain(record.id) } label: {
-                        HStack(alignment: .top, spacing: 9) {
-                            Image(systemName: icon).frame(width: 14).padding(.top, 2).foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(record.displayTitle).lineLimit(2)
-                                if let status = model.listStatus(record) { Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(2).help(status) }
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }.buttonStyle(.plain).contextMenu { prContextMenu(record) }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(record.displayTitle).lineLimit(1)
+                            if let status = model.listStatus(record) { Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1).help(status) }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5).padding(.leading, 42).padding(.trailing, 14).contentShape(Rectangle())
+                    }.buttonStyle(MenuRowStyle()).contextMenu { prContextMenu(record) }
                 }
             }
-        }.padding(12).opacity(model.connected ? 1 : 0.4)
+        }
     }
     @ViewBuilder private func prContextMenu(_ record: PullRequestRecord) -> some View {
         Button("Open PR") { model.track("open_pr", number: record.id); model.openGitHub(record.snapshot.url) }
@@ -812,4 +798,162 @@ struct RunHistoryView: View {
 struct ActivityView: View {
     @ObservedObject var model: InboxModel
     var body: some View { ScrollView { VStack(alignment: .leading, spacing: 18) { Text("All runs").font(.title2.weight(.semibold)); RunHistoryView(runs: model.allRuns, model: model, showPR: true) }.frame(maxWidth: .infinity, alignment: .topLeading).padding(20) }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background(Color(nsColor: .windowBackgroundColor)) }
+}
+
+/// Gifox-style toolbar: window shortcuts on the left, the title centered, the run mode as three toggles on the right.
+private struct MenuHeader: View {
+    @ObservedObject var model: InboxModel
+    var body: some View {
+        ZStack {
+            Text("Woodshed").font(.headline)
+            HStack(spacing: 2) {
+                MenuIconButton(symbol: "macwindow", help: "Open Woodshed (⌘O)") { model.showMain() }.keyboardShortcut("o")
+                MenuIconButton(symbol: "gearshape", help: "Settings (⌘,)") { model.showSettings() }.keyboardShortcut(",")
+                Spacer()
+                if model.connected {
+                    let current = model.pendingMode ?? model.mode
+                    ForEach(Mode.allCases) { mode in
+                        MenuIconButton(symbol: mode.symbol, help: mode.explanation, selected: current == mode) { model.setMode(mode) }
+                            .disabled(!model.canSaveSettings || model.pendingMode != nil)
+                            .accessibilityLabel(mode.label).accessibilityAddTraits(current == mode ? .isSelected : [])
+                    }
+                } else {
+                    Label("Offline", systemImage: "wifi.slash").font(.caption).foregroundStyle(.secondary).padding(.trailing, 6)
+                }
+            }
+        }.padding(.horizontal, 8).padding(.vertical, 7)
+    }
+}
+private struct MenuFooter: View {
+    @ObservedObject var model: InboxModel
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "dollarsign.circle").foregroundStyle(.secondary)
+            Text(model.spendFooter.replacingOccurrences(of: "Est. today ", with: "")).font(.caption).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
+                .help(model.spendFooter)
+            Spacer()
+            Menu {
+                Button("Open Woodshed") { model.showMain() }
+                Button("Activity") { model.showActivity() }
+                Button("Settings…") { model.showSettings() }
+                Divider()
+                Button("Quit Woodshed") { NSApplication.shared.terminate(nil) }
+            } label: { Image(systemName: "ellipsis") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("More")
+            Button("") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q").opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
+        }.padding(.horizontal, 14).padding(.vertical, 9).opacity(model.connected ? 1 : 0.5)
+    }
+}
+private struct MenuIconButton: View {
+    let symbol: String
+    let help: String
+    var selected = false
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 14, weight: selected ? .semibold : .regular)).frame(width: 28, height: 24)
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                .background(selected ? Color.accentColor.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }.buttonStyle(MenuIconStyle()).help(help)
+    }
+}
+private struct MenuIconStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { Hovering { hovered in configuration.label.background(hovered ? Color.primary.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 6)).opacity(configuration.isPressed ? 0.6 : 1) } }
+}
+private struct MenuRowStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { Hovering { hovered in configuration.label.background(Color.primary.opacity(configuration.isPressed ? 0.1 : hovered ? 0.06 : 0)) } }
+}
+private struct Hovering<Content: View>: View {
+    @State private var hovered = false
+    let content: (Bool) -> Content
+    var body: some View { content(hovered).onHover { hovered = $0 } }
+}
+private struct MenuDivider: View { var body: some View { Divider() } }
+private struct MenuRow<Glyph: View>: View {
+    let title: String
+    let detail: String
+    let number: Int
+    var accent: Color? = nil
+    var trailing: String? = nil
+    @ViewBuilder let glyph: Glyph
+    let open: () -> Void
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: open) {
+                HStack(alignment: .center, spacing: 12) {
+                    glyph.frame(width: 16)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title).font(.body.weight(.medium)).lineLimit(1)
+                        HStack(spacing: 6) {
+                            Text(detail).lineLimit(1).foregroundStyle(accent ?? .secondary)
+                            Text("#\(String(number))").foregroundStyle(.tertiary).monospacedDigit()
+                        }.font(.caption)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    if let trailing { Text(trailing).font(.caption).foregroundStyle(.secondary).monospacedDigit() }
+                }.padding(.horizontal, 14).padding(.vertical, 10).contentShape(Rectangle())
+            }.buttonStyle(MenuRowStyle()).help(detail)
+            MenuDivider()
+        }
+    }
+}
+private struct MenuNotice: View {
+    let icon: String
+    let text: String
+    var action: String? = nil
+    var perform: (() -> Void)? = nil
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: icon).foregroundStyle(.orange).frame(width: 16).padding(.top, 1)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    if let action, let perform { Button(action, action: perform).controlSize(.small) }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.padding(.horizontal, 14).padding(.vertical, 10).background(Color.orange.opacity(0.08))
+            Divider()
+        }
+    }
+}
+private struct MenuGroup<Content: View>: View {
+    let title: String
+    let count: Int
+    let icon: String
+    @ViewBuilder let content: Content
+    @State private var expanded = false
+    var body: some View {
+        VStack(spacing: 0) {
+            Button { withAnimation(.easeOut(duration: 0.18)) { expanded.toggle() } } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: icon).foregroundStyle(.secondary).frame(width: 16)
+                    Text(title).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(String(count)).font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary).rotationEffect(.degrees(expanded ? 90 : 0))
+                }.padding(.horizontal, 14).padding(.vertical, 9).contentShape(Rectangle())
+            }.buttonStyle(MenuRowStyle()).accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            if expanded { VStack(spacing: 0) { content }.padding(.bottom, 6) }
+            MenuDivider()
+        }
+    }
+}
+extension Mode {
+    var symbol: String { switch self { case .watch: "eye"; case .auto: "hammer"; case .paused: "pause.circle" } }
+    var explanation: String {
+        switch self {
+        case .watch: "Watch: track PRs and report, without starting repairs"
+        case .auto: "Auto: start repairs on its own"
+        case .paused: "Paused: let running repairs finish, start nothing new"
+        }
+    }
+}
+
+struct WoodshedStatusIcon: View {
+    @ObservedObject var model: InboxModel
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Image(systemName: !model.connected ? "wifi.slash" : model.mode == .paused ? "pause.circle" : model.mode == .auto ? "hammer.fill" : "hammer").font(.system(size: 15))
+                .symbolEffect(.pulse, options: .repeating, isActive: model.connected && !model.running.isEmpty)
+            if model.attentionCount > 0 { Circle().fill(.orange).frame(width: 6, height: 6).offset(x: 3, y: -2) }
+        }.frame(width: 22, height: 18).accessibilityLabel("Woodshed, \(model.mode.label), \(model.attentionCount) need you")
+    }
 }
