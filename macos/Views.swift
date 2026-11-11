@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ModePicker: View {
     @ObservedObject var model: InboxModel
@@ -121,7 +122,7 @@ struct MenuContent: View {
                 Button("Settings…") { model.showSettings() }.buttonStyle(.plain).keyboardShortcut(",")
                 Button("Quit Woodshed") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).keyboardShortcut("q")
             }.padding(16)
-        }.frame(width: 370).background(Color(nsColor: .windowBackgroundColor))
+        }.frame(width: 370).background(Color(nsColor: .windowBackgroundColor)).background(GeometryReader { MenuWindowFit(height: $0.size.height) })
     }
     private func statusGroup(_ title: String, records: [PullRequestRecord], icon: String) -> some View {
         Fold(title) {
@@ -812,4 +813,19 @@ struct RunHistoryView: View {
 struct ActivityView: View {
     @ObservedObject var model: InboxModel
     var body: some View { ScrollView { VStack(alignment: .leading, spacing: 18) { Text("All runs").font(.title2.weight(.semibold)); RunHistoryView(runs: model.allRuns, model: model, showPR: true) }.frame(maxWidth: .infinity, alignment: .topLeading).padding(20) }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background(Color(nsColor: .windowBackgroundColor)) }
+}
+
+/// MenuBarExtra grows its window with the menu but never shrinks it, and centers the content in the leftover space.
+/// When a Needs you card resolves while the menu is open, the panel drops below the menu bar over an invisible,
+/// click-swallowing margin. Fit the window to the content, keeping its top edge under the menu bar.
+struct MenuWindowFit: NSViewRepresentable {
+    let height: CGFloat
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        let height = height
+        DispatchQueue.main.async {
+            guard let window = view.window, height > 0, abs(window.frame.height - height) > 0.5 else { return }
+            window.setFrame(NSRect(x: window.frame.minX, y: window.frame.maxY - height, width: window.frame.width, height: height), display: true)
+        }
+    }
 }

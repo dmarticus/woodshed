@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Foundation
 
 final class MockController: @unchecked Sendable {
@@ -269,6 +270,40 @@ struct InteractionSmoke {
         report("PASS: Trunk queue progress has its own section; terminal events need attention and notify once per attempt across head changes")
     }
     static func report(_ message: String) { print(message); fflush(nil) }
+    static func checkMenuAnchor(_ payload: [String: Any]) async throws {
+        let base = (payload["prs"] as! [[String: Any]])[0]
+        func state(attention: Bool) throws -> InboxState {
+            var data = payload
+            data["prs"] = [301, 302, 303].map { number -> [String: Any] in
+                var record = base
+                record["snapshot"] = (base["snapshot"] as! [String: Any]).merging(["number": number, "draft": false]) { _, next in next }
+                record["decision"] = attention && number != 303 ? ["kind": "human", "reason": "The queue submission was cancelled before this PR could merge."] : ["kind": "waiting", "reason": "Waiting for checks to finish"]
+                record["paused"] = false; record.removeValue(forKey: "job")
+                return record
+            }
+            return try JSONDecoder().decode(InboxState.self, from: JSONSerialization.data(withJSONObject: data))
+        }
+        let model = InboxModel(previewState: try state(attention: true))
+        precondition(model.attention.count == 2)
+        // Like MenuBarExtra's window: sized to the content once, then never shrunk by AppKit.
+        let host = NSHostingView(rootView: MenuContent(model: model))
+        host.sizingOptions = []
+        let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 370, height: 100), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        window.contentView = host
+        func contentHeight() -> CGFloat { NSHostingView(rootView: MenuContent(model: model)).fittingSize.height }
+        window.setContentSize(NSSize(width: 370, height: contentHeight()))
+        window.setFrameTopLeftPoint(NSPoint(x: 200, y: NSScreen.main?.visibleFrame.maxY ?? 800))
+        window.orderFrontRegardless()
+        try await Task.sleep(for: .milliseconds(200))
+        let top = window.frame.maxY, height = window.frame.height
+        model.state = try state(attention: false)
+        try await Task.sleep(for: .milliseconds(300))
+        precondition(window.frame.height < height - 20, "The menu window must shrink with its content (still \(window.frame.height)pt of \(height)pt)")
+        precondition(abs(window.frame.maxY - top) < 0.5, "The menu must stay attached to the menu bar when its content shrinks (top moved \(top - window.frame.maxY)pt)")
+        precondition(abs(window.frame.height - contentHeight()) < 1, "The menu window must fit its content without a margin (\(window.frame.height)pt for \(contentHeight())pt)")
+        window.close()
+        report("PASS: the menu stays attached to the menu bar when Needs you cards resolve while it is open")
+    }
     static func main() async throws {
         _ = NSApplication.shared
         let args = CommandLine.arguments
@@ -286,6 +321,7 @@ struct InteractionSmoke {
         report("PASS: notifications wait for a stable decision and reset when attention changes or disappears")
         try checkMergeQueue(payload)
         try checkSections(payload)
+        try await checkMenuAnchor(payload)
         DelayedController.server.state = payload
         URLProtocol.registerClass(DelayedController.self)
         let token = FileManager.default.temporaryDirectory.appendingPathComponent("woodshed-smoke-\(UUID().uuidString)")
