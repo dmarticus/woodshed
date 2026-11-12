@@ -2,7 +2,7 @@ import { MergedDecisions, type DecisionRepository } from "./merged-decisions";
 import { Outcomes, repositoryPath } from "./outcomes";
 import { randomUUID } from "node:crypto";
 import { statfsSync } from "node:fs";
-import { approvalRequestState, hasRequestedApproval, stamphogRefused, decide, fingerprint, modeOf, repairResolved, failed, type Config, type Record, type Snapshot, type Job, type Run } from "./model";
+import { approvalRequestState, hasRequestedApproval, stamphogRefused, decide, fingerprint, modeOf, repairResolved, failed, type Config, type Decision, type Record, type Snapshot, type Job, type Run } from "./model";
 import { localDay } from "./usage";
 import { GitHub } from "./github";
 import { Runner } from "./runner";
@@ -22,6 +22,9 @@ import { ownerAttention, attentionStillNeeded } from "./owner-attention";
 import { QueueSubmissionRejected, trackMergeQueue, mergeQueueDecision } from "./merge-queue";
 import { queueSubmission } from "./merge-queue-readiness";
 import { buildInfo } from "./build-info";
+
+// The designed verify-and-follow-up flow needs fewer investigations of one commit than this.
+const MAX_HEAD_INVESTIGATIONS = 6;
 
 export class Controller {
   syncing = false;
@@ -364,6 +367,7 @@ export class Controller {
     if (record.decision.kind === "fix" && record.attempts >= this.config.maxAttempts)
       record.decision = { kind: "human", reason: `${record.attempts} attempts without clearing this feedback. Inspect before retrying.` };
     if (await this.assess(record, observeOnly)) {
+      if (record.decision.kind === "ready") record.series = undefined;
       if (!record.stateSince || previousKind !== record.decision.kind || previousHead !== snapshot.head) record.stateSince = new Date().toISOString();
       bindDecision(record);
       if (record.pendingAnswer && record.decision.kind === "human") {
@@ -402,6 +406,8 @@ export class Controller {
         try {
           if (await this.requestStamphog(record, snapshot.head)) this.telemetry?.action(snapshot.number, "request-approval", "automation");
         } catch (error) { this.telemetry?.action(snapshot.number, "request-approval", "automation", true); throw error; }
+      } else if (record.decision.kind === "fix" && !record.job && this.seriesHold(record, false)) {
+        record.humanHead = snapshot.head; record.humanReason = record.decision.reason;
       } else if (record.decision.kind === "fix" && !record.job && this.activeSlots() < this.parallelLimit()) {
         const available = this.config.workerProtocol ? this.launchBudget(this.config.runCapUSD ?? 5, snapshot.number) : Infinity;
         const limit = this.config.runCapUSD ?? 5;
@@ -438,6 +444,7 @@ export class Controller {
         this.store.log(snapshot.number, `Started ${record.job.name}`);
       }
     }
+    if (record.decision.kind === "ready") record.series = undefined;
     if (previousKind !== record.decision.kind) this.store.log(snapshot.number, record.decision.reason);
     if (!record.stateSince || previousKind !== record.decision.kind || previousHead !== snapshot.head) record.stateSince = new Date().toISOString();
     this.store.put(record);
@@ -550,6 +557,23 @@ export class Controller {
     record.decision = { kind: "waiting", reason: "Checking the result against GitHub" };
     record.stateSince = new Date().toISOString();
   }
+  // A PR's runs share one cap until it is ready or its owner rechecks it, so repeated runs cannot add up unseen.
+  private seriesHold(record: Record, investigation: boolean): boolean {
+    const pr = record.snapshot, spent = this.store.prSpent(pr.number);
+    const series = record.series ??= { baseUSD: spent, investigations: 0 };
+    const cap = this.config.prCapUSD ?? 10, used = spent - series.baseUSD;
+    const action = { label: "Open pull request", url: pr.url };
+    let hold: Decision | undefined;
+    if (investigation && series.head === pr.head && series.investigations >= MAX_HEAD_INVESTIGATIONS)
+      hold = { kind: "human", response: "recheck", title: "Investigations stopped on this commit", reason: `Woodshed checked this commit ${series.investigations} times without a ready result.`, question: "Choose Recheck GitHub to investigate again, or open the PR to inspect it.", action };
+    else if (used >= cap)
+      hold = { kind: "human", response: "recheck", title: "Review this PR's spend", reason: `Runs on this PR used $${used.toFixed(2)} without a ready result. The per-PR cap is $${cap.toFixed(2)}.`, question: "Choose Recheck GitHub to allow more runs, or open the PR to inspect it.", action };
+    series.held = hold?.reason;
+    if (!hold) return false;
+    if (record.decision.reason !== hold.reason) this.store.log(pr.number, hold.reason);
+    record.decision = hold;
+    return true;
+  }
   private async assess(record: Record, observeOnly: boolean): Promise<boolean> {
     const pr = record.snapshot;
     if (!this.runner.launchTriage || record.paused || record.watching === false || record.skippedHead === pr.head || pr.draft || pr.state !== "OPEN" || record.budgetDay) return false;
@@ -563,6 +587,7 @@ export class Controller {
     assessment.id ??= randomUUID();
     if (record.job?.kind === "triage") { record.decision = { kind: "waiting", reason: "Checking the result against GitHub" }; return true; }
     if (record.job) return false;
+    const automated = (modeOf(this.config) === "auto" || assessment.allowWatch) && modeOf(this.config) !== "paused";
     if (assessment.result?.route === "repair" && assessment.result.category === "review" && !assessment.result.review_threads && assessment.result.instructions?.startsWith("Continue the original maintenance task in its saved checkout. GitHub still reports:")) {
       assessment.result = undefined; assessment.attempts = 0;
       assessment.report += "\nThe previous review-wait verdict was converted into a repair by the controller. Recheck each unresolved thread on the current commit and return its review_threads disposition. Preserve real defects and reviewer-owned actions.";
@@ -660,6 +685,7 @@ export class Controller {
           return true;
         }
         record.decision = { kind: "waiting", reason: "Agent follow-up queued" };
+        if (automated && this.seriesHold(record, false)) return true;
         if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.parallelLimit()) return true;
         const source = assessment.sourceJob;
         if (source?.head === pr.head && source.adapter === "app-server") {
@@ -698,6 +724,7 @@ export class Controller {
       assessment.attention = ownerAttention(pr, { head: pr.head, route: "ask", category: "internal", title: record.decision.title!, reason: record.decision.reason, evidence: [] }, record.decision);
       return true;
     }
+    if (automated && this.seriesHold(record, true)) return true;
     if (observeOnly || (modeOf(this.config) !== "auto" && !assessment.allowWatch) || modeOf(this.config) === "paused" || this.activeSlots(pr.number) >= this.parallelLimit()) return true;
     const available = this.budgetAvailable();
     const budget = this.launchBudget(Math.min(1, this.config.runCapUSD ?? 5), pr.number);
@@ -711,6 +738,8 @@ export class Controller {
     }
     const job: Job = { name: `ws-triage-${pr.number}-${randomUUID().slice(0, 8)}`, head: pr.head, fingerprint: record.fingerprint, startedAt: new Date().toISOString(), kind: "triage", model: this.config.defaultModel, budgetUSD: budget, adapter: "app-server" };
     this.admitted(); record.job = job; assessment.attempts++;
+    const series = record.series!;
+    series.investigations = series.head === pr.head ? series.investigations + 1 : 1; series.head = pr.head;
     this.store.put(record); this.store.saveRun(this.initialRun(job, pr.number));
     void this.shadowRoute(pr, job, assessment.id, assessment.report);
     try {
@@ -919,6 +948,7 @@ export class Controller {
       record.decision = { kind: "waiting", reason: "Refreshing PR state" };
     } else if (action === "recheck" || action === "reply" && record.assessment?.result?.route === "ask") {
       if (action === "recheck" && record.recovery) { record.recovery.attempts = 0; record.recovery.retryAt = new Date(this.now()).toISOString(); }
+      record.series = undefined;
       if (action === "reply" && (!input.message?.trim() || input.message.length > 8000)) throw new Error("Enter a reply of at most 8000 characters");
       if (record.assessment) {
         record.assessment.reply = input.message?.trim();
@@ -973,7 +1003,7 @@ export class Controller {
       record.humanHead = undefined;
       record.humanReason = undefined;
       record.humanObservation = undefined;
-      record.attempts = 0;
+      record.attempts = 0; record.series = undefined;
       record.runRequested = true;
       record.watching = true; record.skippedHead = undefined; record.requestedModel = input.model;
       record.instructions = input.message?.trim();

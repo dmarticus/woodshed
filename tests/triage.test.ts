@@ -324,6 +324,45 @@ test("an operations question remains stable through check updates and an explici
 });
 
 
+test("repeated investigations of one commit stop until the owner rechecks", async () => {
+  const h = harness(); await h.controller.prepareAttention();
+  h.outcome({ state: "triaged", assessment: { ...answer("wait"), category: "checks" } });
+  for (let i = 0; i < 6; i++) { const churned = { ...h.snapshot, updatedAt: `t${i}` }; await h.controller.reconcile(churned); await h.controller.reconcile(churned); }
+  expect(h.launches()).toBe(6); expect(h.store.get(42)?.decision.kind).toBe("waiting");
+  await h.controller.reconcile({ ...h.snapshot, updatedAt: "t6" });
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", response: "recheck", title: "Investigations stopped on this commit" }); expect(h.launches()).toBe(6);
+  await h.controller.reconcile({ ...h.snapshot, updatedAt: "t7" }, true);
+  expect(h.store.get(42)?.decision.kind).toBe("human");
+  await h.controller.action(42, "recheck", { head: "abc" });
+  await h.controller.reconcile({ ...h.snapshot, updatedAt: "t8" }); expect(h.launches()).toBe(7);
+});
+
+test("runs on one PR share a cap across runs, and a ready result starts a new series", async () => {
+  const h = harness(); h.controller.config.prCapUSD = 0.25; await h.controller.prepareAttention();
+  h.outcome({ state: "triaged", assessment: { ...answer("wait"), category: "checks" } });
+  for (let i = 0; i < 3; i++) { const churned = { ...h.snapshot, updatedAt: `t${i}` }; await h.controller.reconcile(churned); await h.controller.reconcile(churned); }
+  expect(h.launches()).toBe(3);
+  await h.controller.reconcile({ ...h.snapshot, updatedAt: "t3" });
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "Review this PR's spend", reason: "Runs on this PR used $0.30 without a ready result. The per-PR cap is $0.25." }); expect(h.launches()).toBe(3);
+  await h.controller.action(42, "recheck", { head: "abc" });
+  await h.controller.reconcile(h.snapshot); expect(h.launches()).toBe(4);
+  h.outcome({ state: "triaged", assessment: answer("ready") }); await h.controller.reconcile(h.snapshot);
+  expect(h.store.get(42)?.decision.kind).toBe("ready"); expect(h.store.get(42)?.series).toBeUndefined();
+});
+
+test("a repair does not start when the PR's earlier runs already reached its cap", async () => {
+  const h = harness(); let repairs = 0; h.runner.launch = async () => { repairs++; };
+  const failing = { ...h.snapshot, checks: [{ ...h.snapshot.checks[0], conclusion: "FAILURE" }] };
+  const record = h.store.get(42)!; record.humanHead = undefined; record.humanReason = undefined; record.decision = { kind: "waiting", reason: "Checking PR" }; record.series = { baseUSD: 0, investigations: 0 }; h.store.put(record);
+  h.store.saveRun({ id: "ws-42-earlier", number: 42, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), state: "succeeded", model: "model", turns: 40, costUSD: 12, costsByDay: {}, summary: "Published a repair" });
+  await h.controller.reconcile(failing);
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", reason: "Runs on this PR used $12.00 without a ready result. The per-PR cap is $10.00." });
+  expect(repairs).toBe(0); expect(h.store.get(42)?.job).toBeUndefined();
+  await h.controller.reconcile(failing, true); await h.controller.reconcile(failing);
+  expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "Review this PR's spend" });
+  expect(repairs).toBe(0); expect(h.launches()).toBe(0);
+});
+
 test("a new commit supersedes an owner escalation and a changed relevant thread triggers verification", async () => {
   for (const change of ["head", "thread"] as const) {
     const h = harness(); const record = h.store.get(42)!; record.humanHead = undefined;
