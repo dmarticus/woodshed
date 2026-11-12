@@ -63,6 +63,22 @@ It creates an Ed25519 signing key under `~/Library/Application Support/Woodshed/
 
 The config records only `gitSigningKey`, the private key's absolute path. Restart the controller after setup. Existing active workers can be updated with `bun scripts/upgrade-workers.ts <PR numbers>` while the controller is stopped. This retains their worktrees, Codex threads, spend, and concurrency limits; genuine product questions remain waiting.
 
+#### Read-only worker token
+
+Workers read untrusted text: review comments, CI logs, and repository content. Give them their own read-only GitHub token so that a prompt injection cannot use the controller's login, which can push and change workflows. The controller still does every commit and push.
+
+```sh
+bun scripts/setup-worker-token.ts
+```
+
+The script explains how to create a fine-grained token for the watched repository only, with read access to Actions, Checks, Commit statuses, Contents, Issues, and Pull requests. It checks that the token can read the repository and that GitHub refuses a write, saves it as `worker-github-token` in the Woodshed support directory with mode 0600, and records its path as `workerGitHubTokenPath` in the config. Restart the controller after setup.
+
+Each worker starts through `src/worker-launch.ts`, which reads the token file at startup. Workers get it as `GH_TOKEN`, with an empty per-run `GH_CONFIG_DIR` and a Git credential helper that supplies only this token, so `gh` and Git cannot fall back to the controller's login. The token never appears in argv, prompts, logs, `worker.json`, or the config. The controller's own `gh` and Git processes are unchanged.
+
+If `workerGitHubTokenPath` is set but the file is missing, unreadable, malformed, or readable by other users, Woodshed does not start or resume workers. Affected PRs show **Fix the worker GitHub token**, and `/health` reports `worker-token-unreadable`. Without the setting, workers share the controller's login as before, and `/health` reports `worker-token-shared`.
+
+With a read-only token, agents cannot post to GitHub themselves. A repair agent returns any review reply in its result as `"replies":[{"thread":"<id>","body":"…","resolve":false}]`, and the controller posts it with its own login after publishing, or when the run makes no change. It accepts one reply per review thread on that PR, signs each with "via Woodshed", and resolves a thread only when the agent asks. Agents can no longer react to PostHog Review findings. On a Mac, or a host without job isolation, a worker can still read the controller's credential files because both run as the same user; see [Isolated jobs](#isolated-jobs).
+
 Automation settings choose the default model and optionally escalate to another model after a failed attempt. Available models come from your local Codex catalog, using your existing login. A per-run override does not change that default.
 
 ### Spend
@@ -198,7 +214,7 @@ bun scripts/setup-signing.ts
 systemctl --user restart woodshed.service
 ```
 
-Bootstrap creates a private user service in **Watch** mode. It checks tool availability, GitHub and Codex login, and persistent user services. The API token lives at `$XDG_CONFIG_HOME/woodshed/api-token`, or `~/.config/woodshed/api-token`. The unattended signing key lives alongside it under `signing/`. The service restarts after failure and starts at boot with lingering enabled. It invokes Bun directly; hc owns individual agent sessions. Stopping the controller leaves those sessions intact.
+Bootstrap creates a private user service in **Watch** mode. It checks tool availability, GitHub and Codex login, and persistent user services. The API token lives at `$XDG_CONFIG_HOME/woodshed/api-token`, or `~/.config/woodshed/api-token`. The unattended signing key lives alongside it under `signing/`. The service restarts after failure and starts at boot with lingering enabled. It invokes Bun directly; hc, or a systemd unit per run with [job isolation](#isolated-jobs), owns individual agent sessions. Stopping the controller leaves those sessions intact.
 
 Cut over only after pausing local scheduling and letting every local job finish, including saved or blocked jobs. Confirm there are no local jobs left, then stop the local `woodshed` controller. Keep its database and worktrees as a backup. Remote bootstrap discovers matching PRs afresh; it does not migrate local sessions or history.
 
@@ -212,6 +228,32 @@ hc run --bg --no-parent --name woodshed-tunnel --cwd /absolute/path/to/woodshed 
 The tunnel script reconnects after SSH interruptions with bounded backoff and requires existing SSH authentication. An SSH alias named `woodshed-vm` must already exist in your SSH config. Securely copy the VM's API token to a private local file (mode 0600), then run `bun scripts/connect-remote.ts woodshed-vm /path/to/that/file`. The command verifies it is reaching the headless service, writes a private connection file, and leaves the local credential intact. Reopen the app and reconnect MCP. Enable Auto on the remote controller only after confirming that the local controller is stopped. Never run both controllers in Auto for the same PRs.
 
 The Mac app and MCP bridge read `~/Library/Application Support/Woodshed/controller.json`. The connection uses a loopback tunnel and a separate remote token. General settings show where runs execute. Opening a run attaches to the remote hc machine. Mac sleep stops local delivery until reconnection; it does not pause the remote service. A remote GitHub login must be refreshed on the VM. Removing the connection file returns clients to the local controller on their next restart; stop the remote scheduler before resuming local Auto. Notifications while the Mac is asleep require a separate delivery channel and are not provided by the tunnel.
+
+#### Isolated jobs
+
+On a Linux host, each run can be its own systemd unit, running as a separate `woodshed-worker` user instead of under hc as the controller's user. An agent then cannot read the controller's GitHub login, signing key, API token, or database. It cannot see other jobs, write the shared Git repository, or answer its own permission requests. Setup needs root once:
+
+```sh
+sudo bash scripts/setup-job-isolation.sh          # as an administrator; rerun after upgrades, --check to inspect
+bun scripts/setup-worker-token.ts                 # as woodshed
+sudo -u woodshed-worker -H codex login --device-auth
+```
+
+Then set `"jobIsolation": "systemd"` in the config, restart the controller, and run `bun scripts/smoke-access.ts woodshed.config.json`, which runs a real agent in an isolated unit. Existing herdr runs are not moved; let them finish first.
+
+The script creates the `woodshed-worker` user, a fixed `woodshed-job@.service` template, and a polkit rule. The rule lets `woodshed` start and stop `woodshed-job@ws-*` units only, so the controller never needs root again. Each unit:
+
+- runs `src/worker.ts` on its own `worker.json`, with `/home` replaced by an empty directory except this job, the shared `.git` (read-only), the release, and Bun;
+- can write only its checkout, its `agent-result`, and its own `worker` state directory. The job directory itself stays read-only, so the agent cannot plant files the controller writes or follows;
+- gets the read-only token as a systemd credential, never a file it can see on disk;
+- is limited to 3 GB of memory and 1024 tasks with a private `/tmp`. A run over the memory limit is killed and shown as failed rather than resumed. Stopping a run stops every process it started, including database servers;
+- runs under an AppArmor profile that allows user namespaces. Ubuntu otherwise blocks them, which makes Codex's sandbox fail and agents escalate to running commands unsandboxed. Isolated runs get a working Codex sandbox inside the unit.
+
+The controller treats everything in a job's checkout as the agent's. Its Git commands there name the worktree's admin directory themselves instead of trusting the checkout's `.git` file, and they never run repository hooks or an fsmonitor. So the controller commits and pushes without the repository's pre-commit and pre-push hooks, and agents are told to run the formatters and linters those hooks would. CI still runs every check. Files the agent writes are read without following symlinks.
+
+Questions an agent asks still appear in the app and can be answered there. Permission requests can only be answered on the host, as `woodshed`, with `woodshed-respond`: with no arguments it lists waiting runs; `woodshed-respond <run>` shows recent output and asks. **Open in Terminal** in the app runs it over SSH to the connected machine. Housekeeping first runs `woodshed-job-release@<run>` to hand back files the agent made private, then deletes them as usual.
+
+`/health` reports `job-isolation-broken` when isolation is configured but the unit or token is missing or does not match, and Woodshed then starts no workers. A remote controller without isolation reports `jobs-not-isolated`.
 
 After connecting, `bun scripts/smoke-mcp.ts --live` verifies tools, bounded waits, and resources through the configured controller connection. Restart existing MCP connections after cutover so they read the remote credential. To reconnect the tunnel automatically after Mac login, run the tunnel script from a user LaunchAgent with `RunAtLoad` and `KeepAlive`; the script handles reconnecting after SSH interruptions. Keep the VM's timezone consistent with the Mac's daily budget, and preserve existing daily usage when migrating a controller so cutover does not reset its spend allowance. Old agent sessions and run history remain on the original machine.
 

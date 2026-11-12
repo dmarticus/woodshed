@@ -1,4 +1,5 @@
 import { resolve, isAbsolute } from "node:path";
+import { realpathSync } from "node:fs";
 import { Controller } from "./controller";
 import { demoRecords, seedDemoOutcomes, demoDecisionRepository } from "./demo";
 import { GitHub } from "./github";
@@ -37,10 +38,13 @@ if (config.concurrencyMode !== undefined && !["fixed", "adaptive"].includes(conf
 for (const [key, min, max] of [["cpuTargetPercent", 20, 95], ["memoryTargetPercent", 50, 90]] as const) if (config[key] !== undefined && (!Number.isInteger(config[key]) || config[key]! < min || config[key]! > max)) throw new Error(`${key} must be an integer between ${min} and ${max}`);
 if (typeof config.automation !== "boolean") throw new Error("automation must be a boolean");
 if (config.automation && (!isAbsolute(config.checkout) || !await Bun.file(resolve(config.checkout, "AGENTS.md")).exists())) throw new Error("Set checkout to an absolute repository path containing AGENTS.md before enabling automation");
-const store = new Store(demo ? ":memory:" : resolve(root, ".woodshed", "state.sqlite"));
+if (config.jobIsolation !== undefined && (config.jobIsolation !== "systemd" || process.platform !== "linux" || config.workerProtocol !== "app-server")) throw new Error("jobIsolation must be systemd, on Linux, with the app-server worker protocol");
+// Isolated job units bind the data directory's real path, so the controller uses it too.
+const dataDir = config.jobIsolation ? realpathSync(resolve(root, ".woodshed")) : resolve(root, ".woodshed");
+const store = new Store(demo ? ":memory:" : resolve(dataDir, "state.sqlite"));
 if (demo) demoRecords().forEach(r => store.put(r));
-const analytics = new Analytics(resolve(root, ".woodshed"), { enabled: !demo });
-const controller = new Controller(config, store, new GitHub(config), new Runner(config, resolve(root, ".woodshed")), Date.now, analytics, undefined, demo ? demoDecisionRepository() : undefined);
+const analytics = new Analytics(dataDir, { enabled: !demo });
+const controller = new Controller(config, store, new GitHub(config), new Runner(config, dataDir), Date.now, analytics, undefined, demo ? demoDecisionRepository() : undefined);
 if (demo) { controller.github.viewerName = "demo"; seedDemoOutcomes(store, config); await controller.decisions.processPending(); }
 const settings = new Settings(config, configPath, demo);
 if (!demo) await controller.prepareAttention();
@@ -66,8 +70,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
   void (async () => { server.stop(); power.close(); await Promise.race([analytics.flush(), Bun.sleep(1500)]); analytics.close(); process.exit(0); })();
 });
 if (!demo) {
-  void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`));
-  setInterval(() => { void cleanArtifacts(resolve(root, ".woodshed"), store, Date.now(), undefined, controller.decisions).catch(error => store.log(null, `Housekeeping: ${error.message}`)); }, 3600000);
+  const housekeeping = (): void => { void cleanArtifacts(dataDir, store, Date.now(), undefined, controller.decisions, controller.runner.sessions).catch(error => store.log(null, `Housekeeping: ${error.message}`)); };
+  housekeeping(); setInterval(housekeeping, 3600000);
   setInterval(() => { const reaped = reapOrphanedConnects(); if (reaped) store.log(null, `Housekeeping: stopped ${reaped} orphaned hc connect relays`); }, 5 * 60_000);
   void controller.runner.models.list().catch(error => console.error(`Model catalog: ${error.message}`));
   void controller.sync();

@@ -10,7 +10,7 @@ export class CodexRPC {
   onMessage: (message: RPCMessage) => void = () => {};
   onExit: (code: number) => void = () => {};
   constructor(cwd?: string) {
-    this.process = Bun.spawn([process.env.WOODSHED_CODEX ?? "codex", "app-server", "--listen", "stdio://"], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    this.process = Bun.spawn([process.env.WOODSHED_CODEX ?? "codex", "app-server", "--listen", "stdio://"], { cwd, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     const lines = createInterface({ input: Readable.fromWeb(this.process.stdout as any) });
     lines.on("line", line => {
       let message: RPCMessage;

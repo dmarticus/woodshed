@@ -549,8 +549,16 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         let quoted = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("woodshed-\(UUID().uuidString).command")
         do {
-            let target = remoteMachine.map { "\($0)/\(name)" } ?? name
-            try Data("#!/bin/sh\nexec \(quoted) attach '\(target)'\n".utf8).write(to: file, options: .atomic)
+            let script: String
+            // Isolated runs have no terminal to attach to; their questions are answered on the host over SSH.
+            if let remoteMachine, state?.health?.jobs == "systemd" {
+                guard remoteMachine.range(of: "^[A-Za-z0-9._-]{1,64}$", options: .regularExpression) != nil else { return }
+                script = "#!/bin/sh\nexec /usr/bin/ssh -t '\(remoteMachine)' woodshed-respond '\(name)'\n"
+            } else {
+                let target = remoteMachine.map { "\($0)/\(name)" } ?? name
+                script = "#!/bin/sh\nexec \(quoted) attach '\(target)'\n"
+            }
+            try Data(script.utf8).write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
             NSWorkspace.shared.open(file)
         } catch { actionError = error.localizedDescription }

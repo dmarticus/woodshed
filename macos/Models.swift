@@ -68,6 +68,8 @@ struct ControllerHealth: Decodable, Sendable {
     let resumedAt: String?
     let sleeping: Bool
     let warnings: [ControllerWarning]?
+    // "systemd" when each run is an isolated unit answered with woodshed-respond instead of a herdr terminal.
+    let jobs: String?
 }
 struct ControllerWarning: Decodable, Sendable, Identifiable {
     let id: String

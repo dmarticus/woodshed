@@ -1,6 +1,10 @@
 export type Recovery = { head: string; attempts: number; kind: "prepare" | "resume" | "probe"; retryAt?: string; reason: string; freshCheckout?: boolean; instructions?: string };
 
+// The run's session no longer exists, as opposed to the session tool itself failing.
+export class MissingSession extends Error {}
+
 export function missingSession(error: unknown): boolean {
+  if (error instanceof MissingSession) return true;
   return /hc exited 3:/.test(String(error)) && /"kind"\s*:\s*"not_found"|no terminal/.test(String(error));
 }
 

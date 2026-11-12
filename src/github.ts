@@ -5,6 +5,7 @@ import { diagnosticText, namedTestFailures, type CIEvidence, type CheckFailureRe
 import { failed, currentChecks } from "./model";
 import { infrastructureKind, type InfrastructureSignal } from "./ci-incidents";
 import { matchingCodeOwners, reviewerHandle, type ReviewerSuggestion } from "./reviewers";
+import type { ThreadReply } from "./replies";
 
 export class GitHub {
   constructor(readonly config: Config, readonly exec: typeof command = command) {}
@@ -328,6 +329,14 @@ export class GitHub {
       resolved.push(thread.id);
     }
     return { snapshot: resolved.length ? await this.snapshot(pr.number) : fresh, resolved };
+  }
+  async replyToThread(pr: Snapshot, reply: ThreadReply): Promise<void> {
+    if (!pr.threads.some(t => t.id === reply.thread)) throw new Error("The review thread is not on this PR");
+    const posted = JSON.parse(await this.request(["gh", "api", "graphql", "-f", "query=mutation($thread:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$thread,body:$body}){comment{id}}}", "-f", `thread=${reply.thread}`, "-f", `body=${reply.body}`]));
+    if (posted.errors || !posted.data?.addPullRequestReviewThreadReply?.comment?.id) throw new Error("GitHub did not confirm the review reply");
+    if (!reply.resolve) return;
+    const resolved = JSON.parse(await this.request(["gh", "api", "graphql", "-f", "query=mutation($thread:ID!){resolveReviewThread(input:{threadId:$thread}){thread{id isResolved}}}", "-f", `thread=${reply.thread}`]));
+    if (resolved.errors || resolved.data?.resolveReviewThread?.thread?.isResolved !== true) throw new Error("GitHub did not confirm review thread resolution");
   }
   async label(number: number, label: string): Promise<void> {
     await this.request(["gh", "pr", "edit", String(number), "--repo", this.config.repository, "--add-label", label]);
