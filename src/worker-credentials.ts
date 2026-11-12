@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { gitEnvironment } from "./git-environment";
+import { supportDirectory } from "./connection";
 import type { Config } from "./model";
 
 export class WorkerCredentialError extends Error {}
@@ -42,4 +43,10 @@ export function workerCommand(config: Pick<Config, "workerGitHubTokenPath">, dir
   if (!config.workerGitHubTokenPath) return argv;
   readWorkerToken(config.workerGitHubTokenPath);
   return [process.execPath, join(import.meta.dir, "worker-launch.ts"), config.workerGitHubTokenPath, join(directory, "github"), "--", ...argv];
+}
+
+// The token file an isolated job's unit loads: the read-only worker token, or with workerGitHub "controller",
+// a copy of the controller's own token that the runner refreshes before each start.
+export function isolatedTokenPath(config: Pick<Config, "workerGitHubTokenPath" | "workerGitHub">): string | undefined {
+  return config.workerGitHubTokenPath ?? (config.workerGitHub === "controller" ? join(supportDirectory(), "worker-github-token") : undefined);
 }

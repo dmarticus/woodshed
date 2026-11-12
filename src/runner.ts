@@ -1,9 +1,9 @@
 import { mergedDecisionContext, type DecisionView } from "./merged-decisions";
 import { GitHub } from "./github";
 import { activeQueuePhase } from "./merge-queue";
-import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { command } from "./command";
 import { BranchUpdate, SupersededUpdate } from "./branch-update";
 import { Models } from "./models";
@@ -16,7 +16,7 @@ import { parseAssessment, triagePrompt } from "./triage";
 import { missingSession, temporaryFailure } from "./recovery";
 import { handoffContext } from "./handoff";
 import { repairContext, type PublishedResult } from "./playbooks";
-import { readWorkerToken, workerCommand } from "./worker-credentials";
+import { isolatedTokenPath, readWorkerToken, workerCommand } from "./worker-credentials";
 import { HerdrSessions, SystemdSessions, isolationProblem, readUntrustedJSON, untrustedExists, type Sessions, type Terminal } from "./sessions";
 import { isolateJobGit } from "./job-git";
 import { parseReplies } from "./replies";
@@ -42,6 +42,7 @@ export class Runner {
   }
   readonly exec: typeof command;
   readonly sessions: Sessions;
+  tokenPath: string | undefined;
   // herdr can stay up while every command fails (its registry writer stops when the disk fills), so count consecutive failures.
   readonly herdr: { consecutiveFailures: number; failingSince?: string; lastError?: string } = { consecutiveFailures: 0 };
   constructor(readonly config: Config, readonly dataDir: string, exec: typeof command = command) {
@@ -55,6 +56,7 @@ export class Runner {
         throw error;
       }
     };
+    this.tokenPath = isolatedTokenPath(config);
     if (config.jobIsolation === "systemd") {
       this.sessions = new SystemdSessions(dataDir, this.exec);
       mkdirSync(join(dataDir, "jobs"), { recursive: true, mode: 0o700 });
@@ -70,12 +72,22 @@ export class Runner {
   }
   private checkWorkerToken(): void {
     if (this.config.workerGitHubTokenPath) readWorkerToken(this.config.workerGitHubTokenPath);
-    const isolation = this.isolated ? isolationProblem(this.dataDir, this.config.workerGitHubTokenPath) : undefined;
+    const isolation = this.isolated ? isolationProblem(this.dataDir, this.tokenPath) : undefined;
     if (isolation) throw new Error(isolation);
+  }
+  // Without a read-only worker token, isolated jobs get the controller's current gh token, written fresh each start
+  // so a refreshed login reaches new runs.
+  private async shareControllerToken(): Promise<void> {
+    if (this.config.workerGitHubTokenPath || this.config.workerGitHub !== "controller") return;
+    const path = this.tokenPath!;
+    const token = (await this.exec(["gh", "auth", "token", "--hostname", "github.com"])).trim();
+    if (!/^[A-Za-z0-9_]{20,255}$/.test(token)) throw new Error("The controller's gh login did not return a GitHub token. Run gh auth login on the controller host");
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(`${path}.tmp`, `${token}\n`, { mode: 0o600 }); renameSync(`${path}.tmp`, path);
   }
   private startWorker(job: Job, cwd: string, argv: string[]): Promise<void> {
     // An isolated job's unit loads the worker token itself; under herdr a launcher swaps it in.
-    if (this.sessions.kind === "systemd") return this.sessions.run(job.name, cwd, argv);
+    if (this.sessions.kind === "systemd") return this.shareControllerToken().then(() => this.sessions.run(job.name, cwd, argv));
     return this.sessions.run(job.name, cwd, workerCommand(this.config, join(this.dataDir, "jobs", job.name), argv));
   }
   async launch(pr: Snapshot, job: Job): Promise<void> {
