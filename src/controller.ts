@@ -10,7 +10,7 @@ import { Store } from "./store";
 import { assessmentKey } from "./triage";
 import { bindDecision, sameQuestion, remainingRepairDecision } from "./decisions";
 import { checkWithJev, routeBeforeInvestigation, RoutingCheckHealth, wouldSkipInvestigation } from "./jev";
-import { missingSession, recoveryDelay, temporaryFailure, type Recovery } from "./recovery";
+import { MAX_RECOVERY_RETRIES, missingSession, recoveryDelay, recoveryExhausted, temporaryFailure, type Recovery } from "./recovery";
 import { handoffSchema, type Handoff } from "./handoff";
 import { stackBlock, stackOrder } from "./stack";
 import { SharedCI } from "./ci-incidents";
@@ -448,7 +448,7 @@ export class Controller {
     record.recovery = { head: record.snapshot.head, attempts, kind, reason, retryAt: new Date(this.now() + recoveryDelay(attempts)).toISOString(), freshCheckout: previous?.freshCheckout || /promisor remote|not our ref/i.test(reason), instructions: previous?.instructions };
     record.humanHead = undefined; record.humanReason = undefined; record.humanObservation = undefined;
     record.sleepInterruptedAt = undefined; record.lastError = undefined;
-    record.decision = attempts > 3 ? { kind: "human", title: "Retry recovery", reason: "Woodshed could not restore this run after three retries. Existing files are preserved. Retry recovery to try again." } : { kind: "waiting", reason: kind === "prepare" ? "Restoring the checkout before retrying" : "Reconnecting the saved run" };
+    record.decision = attempts > MAX_RECOVERY_RETRIES ? recoveryExhausted(record.recovery) : { kind: "waiting", reason: kind === "prepare" ? "Restoring the checkout before retrying" : "Reconnecting the saved run" };
     this.store.log(record.snapshot.number, `Recovery ${attempts}: ${kind}: ${reason}`);
   }
   private async recover(record: Record, observeOnly: boolean, launchError?: unknown): Promise<boolean> {
@@ -461,9 +461,7 @@ export class Controller {
     }
     const recovery = record.recovery;
     if (recovery?.retryAt) {
-      if (recovery.attempts > 3) {
-        record.decision = { kind: "human", title: "Retry recovery", reason: "Woodshed could not restore this run after three retries. Existing files are preserved. Retry recovery to try again." }; return true;
-      }
+      if (recovery.attempts > MAX_RECOVERY_RETRIES) { record.decision = recoveryExhausted(recovery); return true; }
       record.decision = { kind: "waiting", reason: recovery.kind === "prepare" ? "Restoring the checkout before retrying" : "Reconnecting the saved run" };
       if (observeOnly || this.sleeping || this.now() < Date.parse(recovery.retryAt) || modeOf(this.config) === "paused" || modeOf(this.config) !== "auto" && !record.runRequested && !record.job?.manual) return true;
       if (recovery.kind === "prepare") { recovery.retryAt = undefined; return false; }
@@ -918,7 +916,8 @@ export class Controller {
       record.attempts = 0;
       record.decision = { kind: "waiting", reason: "Refreshing PR state" };
     } else if (action === "recheck" || action === "reply" && record.assessment?.result?.route === "ask") {
-      if (action === "recheck" && record.recovery) { record.recovery.attempts = 0; record.recovery.retryAt = new Date(this.now()).toISOString(); }
+      // A recheck grants one more attempt, not a fresh series of automatic retries against the same failure.
+      if (action === "recheck" && record.recovery) { record.recovery.attempts = Math.min(record.recovery.attempts, MAX_RECOVERY_RETRIES); record.recovery.retryAt = new Date(this.now()).toISOString(); }
       if (action === "reply" && (!input.message?.trim() || input.message.length > 8000)) throw new Error("Enter a reply of at most 8000 characters");
       if (record.assessment) {
         record.assessment.reply = input.message?.trim();

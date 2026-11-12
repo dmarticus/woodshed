@@ -94,9 +94,28 @@ describe("durable controller", () => {
       clock = Date.parse(saved.recovery!.retryAt!) + 1;
     }
     await h.controller.reconcile(broken()); expect(h.launched).toHaveLength(4);
+    expect(h.store.get(42)?.decision.reason).toContain("Last failure: Error: git exited 128: not our ref");
     h.github.snapshot = async () => broken();
     await h.controller.action(42, "recheck", { head: broken().head });
     await h.controller.reconcile(broken()); expect(h.launched).toHaveLength(5);
+    expect(h.store.get(42)?.decision).toMatchObject({ kind: "human", title: "Retry recovery" });
+    clock += 60 * 60_000;
+    await h.controller.reconcile(broken()); expect(h.launched).toHaveLength(5);
+  });
+  test("a recheck during recovery backoff does not restart the retry count", async () => {
+    const h = harness(); let clock = Date.now();
+    h.controller = new Controller(h.config, h.store, h.github, h.runner, () => clock);
+    h.runner.health = async () => ({ state: "missing", started: false });
+    h.runner.launch = async (_: Snapshot, job: any) => { h.launched.push(job.name); throw new Error("git exited 1: merge failed"); };
+    h.github.snapshot = async () => broken();
+    await h.controller.reconcile(broken());
+    clock = Date.parse(h.store.get(42)!.recovery!.retryAt!) + 1;
+    await h.controller.reconcile(broken());
+    expect(h.store.get(42)?.recovery?.attempts).toBe(2);
+    await h.controller.action(42, "recheck", { head: broken().head });
+    await h.controller.reconcile(broken());
+    expect(h.store.get(42)?.recovery?.attempts).toBe(3);
+    expect(h.launched).toHaveLength(3);
   });
   test.each(["missing", "finished"])("a %s worker resumes its saved run with the same budget and no second checkout", async state => {
     const h = harness(); let clock = Date.now(); let resumed = 0;
