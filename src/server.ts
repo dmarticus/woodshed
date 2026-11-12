@@ -39,6 +39,7 @@ for (const [key, min, max] of [["cpuTargetPercent", 20, 95], ["memoryTargetPerce
 if (typeof config.automation !== "boolean") throw new Error("automation must be a boolean");
 if (config.automation && (!isAbsolute(config.checkout) || !await Bun.file(resolve(config.checkout, "AGENTS.md")).exists())) throw new Error("Set checkout to an absolute repository path containing AGENTS.md before enabling automation");
 if (config.jobIsolation !== undefined && (config.jobIsolation !== "systemd" || process.platform !== "linux" || config.workerProtocol !== "app-server")) throw new Error("jobIsolation must be systemd, on Linux, with the app-server worker protocol");
+if (config.workerGitHub !== undefined && (config.workerGitHub !== "controller" || !config.jobIsolation)) throw new Error("workerGitHub must be controller, and only with jobIsolation");
 // Isolated job units bind the data directory's real path, so the controller uses it too.
 const dataDir = config.jobIsolation ? realpathSync(resolve(root, ".woodshed")) : resolve(root, ".woodshed");
 const store = new Store(demo ? ":memory:" : resolve(dataDir, "state.sqlite"));

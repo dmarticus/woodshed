@@ -22,7 +22,7 @@ import { ownerAttention, attentionStillNeeded } from "./owner-attention";
 import { QueueSubmissionRejected, trackMergeQueue, mergeQueueDecision } from "./merge-queue";
 import { queueSubmission } from "./merge-queue-readiness";
 import { buildInfo } from "./build-info";
-import { workerCredentialProblem } from "./worker-credentials";
+import { isolatedTokenPath, workerCredentialProblem } from "./worker-credentials";
 import { isolationProblem } from "./sessions";
 import type { ThreadReply } from "./replies";
 
@@ -71,7 +71,7 @@ export class Controller {
     }
   }
   private isolationProblem(): string | undefined {
-    return this.config.jobIsolation === "systemd" ? isolationProblem(this.runner.dataDir, this.config.workerGitHubTokenPath) : undefined;
+    return this.config.jobIsolation === "systemd" ? isolationProblem(this.runner.dataDir, isolatedTokenPath(this.config)) : undefined;
   }
   // Why no worker may start right now: a broken worker token or job isolation that is configured but not installed.
   private workerStartProblem(): string | undefined { return workerCredentialProblem(this.config) ?? this.isolationProblem(); }

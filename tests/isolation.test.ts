@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { command } from "../src/command";
@@ -183,4 +183,22 @@ test("a run its unit killed for memory is reported as failed instead of resumed"
   expect((await runner.health(job)).state).toBe("finished");
   expect(await runner.runtime(job)).toMatchObject({ status: "error", state: "failed", summary: "The run used more memory than a job is allowed and was stopped" });
   expect(await runner.status(job)).toEqual({ state: "human", reason: "The run used more memory than a job is allowed and was stopped" });
+});
+
+test("without a read-only token, an isolated run gets the controller's current gh token, private to the controller", async () => {
+  const root = scratch(); const fake = systemctl(); let token = "gho_firsttokenfirsttokenfirst";
+  const exec = (async (argv: string[]) => argv[0] === "gh" ? `${token}\n` : fake.exec(argv)) as any;
+  const runner = new Runner({ repository: "example/project", checkout: "", workerProtocol: "app-server", jobIsolation: "systemd", workerGitHub: "controller" } as Config, root, exec);
+  runner.tokenPath = join(root, "support", "worker-github-token");
+  runner.models.choose = async () => ({ id: "fixture", name: "Fixture", isDefault: true, price: { input: 1, cached: 0, cacheWrite: 0, output: 1 } });
+  (runner as any).checkWorkerToken = () => {};
+  const pr = { number: 7, head: "abc", threads: [], checks: [], reviews: [] } as unknown as Snapshot;
+  await runner.launchTriage(pr, { name: "ws-triage-7-a", head: "abc", fingerprint: "", startedAt: new Date().toISOString(), kind: "triage" }, "report");
+  expect(await Bun.file(runner.tokenPath).text()).toBe("gho_firsttokenfirsttokenfirst\n");
+  expect(statSync(runner.tokenPath).mode & 0o777).toBe(0o600);
+  token = "gho_refreshedrefreshedrefreshed";
+  await runner.launchTriage(pr, { name: "ws-triage-7-b", head: "abc", fingerprint: "", startedAt: new Date().toISOString(), kind: "triage" }, "report");
+  expect(await Bun.file(runner.tokenPath).text()).toBe("gho_refreshedrefreshedrefreshed\n");
+  token = "not a token";
+  await expect(runner.launchTriage(pr, { name: "ws-triage-7-c", head: "abc", fingerprint: "", startedAt: new Date().toISOString(), kind: "triage" }, "report")).rejects.toThrow("gh auth login");
 });

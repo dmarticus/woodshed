@@ -30,7 +30,7 @@ check() {
     [[ -f $RELEASE_UNIT ]] && echo "ok   $RELEASE_UNIT" || { echo "MISSING $RELEASE_UNIT"; ok=0; }
     [[ -f $POLKIT ]] && echo "ok   $POLKIT" || { echo "MISSING $POLKIT"; ok=0; }
     grep -qx woodshed-job /sys/kernel/security/apparmor/profiles 2>/dev/null || grep -q "^woodshed-job " /sys/kernel/security/apparmor/profiles 2>/dev/null && echo "ok   AppArmor profile woodshed-job" || { echo "MISSING AppArmor profile woodshed-job"; ok=0; }
-    [[ -f $TOKEN ]] && echo "ok   worker GitHub token" || echo "todo worker GitHub token: run scripts/setup-worker-token.ts as $CONTROLLER"
+    [[ -f $TOKEN ]] && echo "ok   worker GitHub token" || echo "todo worker GitHub token: run scripts/setup-worker-token.ts as $CONTROLLER, or set workerGitHub to controller"
     [[ -f $WORKER_HOME/.codex/auth.json ]] && echo "ok   worker Codex login" || echo "todo worker Codex login: sudo -u $WORKER -H codex login --device-auth"
     [[ $ok == 1 ]]
 }

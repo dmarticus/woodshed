@@ -57,6 +57,9 @@ export type Config = {
   workerGitHubTokenPath?: string;
   // "systemd" runs each job as a separate Unix user in a hardened unit (scripts/setup-job-isolation.sh) instead of under herdr.
   jobIsolation?: "systemd";
+  // "controller" lets isolated jobs use the controller's own gh token when no read-only worker token is set up.
+  // Agents can then push and change workflows as before; everything else stays isolated.
+  workerGitHub?: "controller";
   // Integrations whose absence should warn in /health and block a deploy, instead of degrading silently.
   requiredIntegrations?: ("typesafe" | "posthog")[];
 };

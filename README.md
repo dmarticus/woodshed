@@ -239,6 +239,8 @@ bun scripts/setup-worker-token.ts                 # as woodshed
 sudo -u woodshed-worker -H codex login --device-auth
 ```
 
+To skip the read-only token, set `"workerGitHub": "controller"` instead of running `setup-worker-token.ts`. Isolated runs then get a fresh copy of the controller's own `gh` token at each start, so agents can push and change workflows as before; everything else stays isolated, and `/health` keeps reporting `worker-token-shared`.
+
 Then set `"jobIsolation": "systemd"` in the config, restart the controller, and run `bun scripts/smoke-access.ts woodshed.config.json`, which runs a real agent in an isolated unit. Existing herdr runs are not moved; let them finish first.
 
 The script creates the `woodshed-worker` user, a fixed `woodshed-job@.service` template, and a polkit rule. The rule lets `woodshed` start and stop `woodshed-job@ws-*` units only, so the controller never needs root again. Each unit:
