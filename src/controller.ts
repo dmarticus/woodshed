@@ -10,7 +10,7 @@ import { Store } from "./store";
 import { assessmentKey } from "./triage";
 import { bindDecision, sameQuestion, remainingRepairDecision } from "./decisions";
 import { checkWithJev, routeBeforeInvestigation, RoutingCheckHealth, wouldSkipInvestigation } from "./jev";
-import { recoveryDelay, temporaryFailure, type Recovery } from "./recovery";
+import { missingSession, recoveryDelay, temporaryFailure, type Recovery } from "./recovery";
 import { handoffSchema, type Handoff } from "./handoff";
 import { stackBlock, stackOrder } from "./stack";
 import { SharedCI } from "./ci-incidents";
@@ -210,7 +210,9 @@ export class Controller {
       return;
     }
     if (!record.job || !this.runner.observe) return;
-    const observation = await this.runner.observe(record.job);
+    // A job whose checkout preparation failed never started a terminal; its failure is already the question.
+    let observation;
+    try { observation = await this.runner.observe(record.job); } catch (error) { if (missingSession(error)) return; throw error; }
     if (observation.state === "working" || observation.state === "done" && ["blocked", "error"].includes(record.humanObservation?.state ?? "")) {
       record.humanHead = undefined; record.humanReason = undefined; record.humanObservation = undefined;
       this.store.log(snapshot.number, "Agent continued outside Woodshed; cleared the answered decision");

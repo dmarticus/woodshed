@@ -6,7 +6,7 @@ import { command } from "../src/command";
 import { defaultTokenPath } from "../src/connection";
 import type { Mode } from "../src/model";
 
-type State = { mode: Mode; syncing: boolean; prs: { job?: unknown }[]; health: { activeRuns: number; build?: { commit: string }; routingCheck?: { state: string }; analytics?: { enabled: boolean }; warnings?: { id: string; message: string }[] } };
+type State = { mode: Mode; syncing: boolean; prs: { job?: unknown; humanHead?: string }[]; health: { activeRuns: number; build?: { commit: string }; routingCheck?: { state: string }; analytics?: { enabled: boolean }; warnings?: { id: string; message: string }[] } };
 
 // Older controllers don't report routingCheck, so an unknown state never counts as lost.
 function integrations(health: State["health"]): Set<string> {
@@ -36,7 +36,8 @@ export async function deploy(ops: Deployment, commit: string, drainMS = 20 * 60_
       checkAbort();
       const state = await ops.state();
       if (state.mode !== (original === "auto" ? "watch" : original)) throw Error("Mode changed during deployment; leaving the current version running");
-      if (!state.syncing && !state.health.activeRuns && !state.prs.some(pr => pr.job)) break;
+      // A job waiting on its owner can wait for days and its terminal outlives the controller; only working jobs block.
+      if (!state.syncing && !state.health.activeRuns && !state.prs.some(pr => pr.job && !pr.humanHead)) break;
       if (ops.now() >= deadline) throw Error("Repairs have not drained; leaving the current version running");
       await ops.wait();
     }
