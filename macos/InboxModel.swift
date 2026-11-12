@@ -517,8 +517,11 @@ final class InboxModel: NSObject, ObservableObject, UNUserNotificationCenterDele
             NSWorkspace.shared.open(command)
         } catch { actionError = error.localizedDescription }
     }
+    /// Set by the menu bar popover so opening a window from it also closes it.
+    var closeMenu: (() -> Void)?
     @discardableResult
     func showWindow(_ key: String, title: String, size: NSSize, content: AnyView) -> NSWindow {
+        closeMenu?()
         if let window = windows[key] {
             if key != "main" { window.title = title }
             if key != "main" { window.contentView = NSHostingView(rootView: content) }
