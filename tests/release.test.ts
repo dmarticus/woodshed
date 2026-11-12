@@ -46,6 +46,16 @@ test("switches only after repairs drain, backs up first, verifies exact commit, 
   expect(f.deployed()).toBe(true);
 });
 
+test("a job waiting on its owner does not hold the deploy, but a working one does", async () => {
+  const f = fixture(); const state = f.ops.state;
+  f.ops.state = async () => ({ ...await state(), prs: [{ job: {}, humanHead: "head" }] });
+  await deploy(f.ops, commit);
+  expect(f.deployed()).toBe(true);
+  const g = fixture(); const working = g.ops.state;
+  g.ops.state = async () => ({ ...await working(), prs: [{ job: {} }] });
+  await expect(deploy(g.ops, commit, 20)).rejects.toThrow("not drained");
+});
+
 test("drain timeout leaves old service running and restores Auto", async () => {
   const f = fixture(); f.active(1);
   await expect(deploy(f.ops, commit, 20)).rejects.toThrow("not drained");

@@ -103,3 +103,12 @@ test.each([true, false, undefined])("cancelled checks only stop blocking when Gi
   const snapshot = { ...healthy(), checks: [{ name: "Optional lint", status: "COMPLETED", conclusion: "CANCELLED", required, url: "" }] };
   expect(decide(snapshot).kind).toBe(required === false ? "ready" : "fix");
 });
+
+test("a question from a run that never started its terminal stays put without a herdr error", async () => {
+  const h = harness(); h.runner.observe = async () => { throw new Error('hc exited 3: {"error":{"kind":"not_found","message":"no terminal \\"fixture-job\\""}}'); };
+  await h.controller.reconcile(broken(), true);
+  const record = h.store.get(42)!;
+  expect(record.decision.kind).toBe("human"); expect(record.humanHead).toBe("head"); expect(record.lastError).toBeUndefined();
+  h.runner.observe = async () => { throw new Error("hc exited 1: registry writer stopped"); };
+  await expect(h.controller.reconcile(broken(), true)).rejects.toThrow("registry writer");
+});
