@@ -12,6 +12,7 @@
   "retryModel": "",
   "runCapUSD": 5,
   "dailyCapUSD": 20,
+  "prCapUSD": 10,
   "port": 7341,
   "reviewLabel": "posthog-review",
   "approvalLabel": "stamphog"

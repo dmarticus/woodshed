@@ -97,6 +97,7 @@ export class Store {
   }
   runs(): Run[] { return this.db.query("SELECT data FROM runs ORDER BY started DESC LIMIT 300").all().map((r: any) => JSON.parse(r.data)); }
   unfinishedRuns(): Run[] { return this.db.query("SELECT data FROM runs WHERE json_extract(data,'$.endedAt') IS NULL").all().map((r: any) => JSON.parse(r.data)); }
+  prSpent(number: number): number { return (this.db.query("SELECT COALESCE(SUM(json_extract(data,'$.costUSD')),0) AS total FROM runs WHERE number=?").get(number) as { total: number }).total; }
   spent(day: string): number { return (this.db.query("SELECT COALESCE(SUM(cost),0) AS total FROM usage_days WHERE day=?").get(day) as { total: number }).total; }
   spend(cap: number) {
     const day = localDay();

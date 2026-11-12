@@ -42,6 +42,7 @@ export type Record = {
   observedAt?: string;
   stackWait?: { number: number; head: string; reason: string };
   ciIncident?: import("./ci-incidents").CIIncident;
+  series?: { baseUSD: number; head?: string; investigations: number; held?: string };
 };
 export type JobObservation = { state: "working" | "blocked" | "done" | "error" | "unknown"; summary: string; promptId?: string };
 export type Config = {
@@ -49,7 +50,7 @@ export type Config = {
   maxConcurrentJobs: number; automation: boolean; port: number; reviewLabel: string; approvalLabel: string;
   concurrencyMode?: "adaptive" | "fixed"; cpuTargetPercent?: number; memoryTargetPercent?: number;
   paused?: boolean;
-  mode?: Mode; defaultModel?: string; retryModel?: string; escalateOnRetry?: boolean; runCapUSD?: number; dailyCapUSD?: number;
+  mode?: Mode; defaultModel?: string; retryModel?: string; escalateOnRetry?: boolean; runCapUSD?: number; dailyCapUSD?: number; prCapUSD?: number;
   modelPrices?: { [model: string]: ModelPrice }; watchFilter?: "mine" | "mine-and-reviews" | "query"; watchQuery?: string;
   workerProtocol?: "app-server";
   gitSigningKey?: string;

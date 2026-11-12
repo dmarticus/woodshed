@@ -45,7 +45,7 @@ export class ProductAnalytics {
         state.decision = undefined; state.decisionAt = undefined;
       }
       if (decision && state.decision !== decision) {
-        const emitted = this.analytics.capture("woodshed_attention_raised", { ...props, decision_id: this.analytics.id(`decision:${decision}`), category: record.budgetDay ? "budget" : record.recovery ? "recovery" : record.assessment?.result?.category ?? "other" }, `attention:${state.episode}:${decision}`);
+        const emitted = this.analytics.capture("woodshed_attention_raised", { ...props, decision_id: this.analytics.id(`decision:${decision}`), category: record.budgetDay ? "budget" : record.series?.held && record.series.held === record.decision.reason ? "run_series" : record.recovery ? "recovery" : record.assessment?.result?.category ?? "other" }, `attention:${state.episode}:${decision}`);
         if (emitted) state.decisions++;
         state.decision = decision; state.decisionAt = this.now();
       }
