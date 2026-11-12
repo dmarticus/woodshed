@@ -1,8 +1,10 @@
 import { gitEnvironment } from "./git-environment";
+import { jobGitEnvironment } from "./job-git";
 
 export async function command(argv: string[], options: { cwd?: string; timeout?: number; input?: string | Uint8Array; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
-  const environment = { ...process.env, ...options.env };
-  const proc = Bun.spawn(argv, { cwd: options.cwd, env: argv[0] === "git" ? gitEnvironment(process.env.WOODSHED_SIGNING_KEY, environment) : environment, stdout: "pipe", stderr: "pipe", stdin: options.input === undefined ? "ignore" : "pipe" });
+  const trusted = argv[0] === "git" ? jobGitEnvironment(options.cwd) : undefined;
+  const environment = { ...process.env, ...options.env, ...trusted?.env };
+  const proc = Bun.spawn(argv, { cwd: options.cwd, env: argv[0] === "git" ? gitEnvironment(process.env.WOODSHED_SIGNING_KEY, environment, "controller", trusted?.config) : environment, stdout: "pipe", stderr: "pipe", stdin: options.input === undefined ? "ignore" : "pipe" });
   if (options.input !== undefined) { (proc.stdin as Bun.FileSink).write(options.input); (proc.stdin as Bun.FileSink).end(); }
   const timer = setTimeout(() => proc.kill(), options.timeout ?? 60_000);
   try {

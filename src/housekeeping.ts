@@ -2,8 +2,10 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmdirSy
 import { join } from "node:path";
 import { command } from "./command";
 import type { Store } from "./store";
+import { readUntrustedJSON, untrustedExists, type Sessions } from "./sessions";
 
-export async function cleanArtifacts(dataDir: string, store: Store, now = Date.now(), exec = command, decisions?: { prune(): Promise<number> }): Promise<void> {
+// `sessions.release` hands an isolated agent's files back to the controller first, since the agent may have made them private.
+export async function cleanArtifacts(dataDir: string, store: Store, now = Date.now(), exec = command, decisions?: { prune(): Promise<number> }, sessions?: Pick<Sessions, "release">): Promise<void> {
   if (decisions) await decisions.prune();
   const root = join(dataDir, "jobs");
   if (!existsSync(root) || lstatSync(root).isSymbolicLink()) return;
@@ -20,8 +22,8 @@ export async function cleanArtifacts(dataDir: string, store: Store, now = Date.n
     if (!run?.endedAt || ["running", "waiting", "budget"].includes(run.state)) continue;
     const record = store.get(run.number);
     if (!record) continue;
-    const runtimeFile = Bun.file(join(directory, "runtime.json"));
-    if (await runtimeFile.exists() && (await runtimeFile.json()).status === "working") continue;
+    const runtimePath = [join(directory, "worker", "runtime.json"), join(directory, "runtime.json")].find(untrustedExists);
+    try { if (runtimePath && readUntrustedJSON(runtimePath).status === "working") continue; } catch { continue; }
     const checkout = join(directory, "checkout");
     if (existsSync(checkout)) {
       if (lstatSync(checkout).isSymbolicLink() || realpathSync(checkout) !== join(realpathSync(directory), "checkout")) continue;
@@ -34,6 +36,7 @@ export async function cleanArtifacts(dataDir: string, store: Store, now = Date.n
         if ((await exec(["git", "rev-list", "-1", "HEAD", "--not", "--remotes"], { cwd: checkout })).trim()) continue;
         const registered = (await exec(["git", "worktree", "list", "--porcelain"], { cwd: checkout })).split("\n").filter(line => line.startsWith("worktree ")).some(line => { try { return realpathSync(line.slice(9)) === realpathSync(checkout); } catch { return false; } });
         if (registered) {
+          await sessions?.release(name);
           const common = (await exec(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: checkout })).trim();
           await exec(["git", "--git-dir", common, "worktree", "remove", checkout], { cwd: dataDir });
         }
@@ -43,6 +46,7 @@ export async function cleanArtifacts(dataDir: string, store: Store, now = Date.n
     }
     if (record.snapshot.state === "OPEN" || !record.closedAt || now - Date.parse(record.closedAt) < 7 * 86400000) continue;
     if (now - Date.parse(run.endedAt) >= 30 * 86400000 && artifactAge >= 30 * 86400000) {
+      await sessions?.release(name);
       rmSync(directory, { recursive: true });
       store.log(run.number, `Removed expired run artifacts for ${name}; spend history retained`);
     }

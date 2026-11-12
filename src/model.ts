@@ -55,6 +55,8 @@ export type Config = {
   gitSigningKey?: string;
   // Owner-only file holding a read-only, single-repository token. When unset, workers share the controller's gh login.
   workerGitHubTokenPath?: string;
+  // "systemd" runs each job as a separate Unix user in a hardened unit (scripts/setup-job-isolation.sh) instead of under herdr.
+  jobIsolation?: "systemd";
   // Integrations whose absence should warn in /health and block a deploy, instead of degrading silently.
   requiredIntegrations?: ("typesafe" | "posthog")[];
 };

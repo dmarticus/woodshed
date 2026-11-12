@@ -6,6 +6,7 @@ import { workerCommand } from "../src/worker-credentials";
 
 const root = resolve(import.meta.dir, "..");
 const config = await Bun.file(join(root, "woodshed.config.json")).json();
+if (config.jobIsolation) throw new Error("upgrade-workers restarts herdr sessions; isolated jobs resume through the controller");
 const store = new Store(join(root, ".woodshed/state.sqlite"));
 for (const number of process.argv.slice(2).map(Number)) {
   const record = store.get(number);

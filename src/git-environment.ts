@@ -1,7 +1,7 @@
 // Workers get only the token in their own environment, never the controller's gh login.
 const workerCredentialHelper = `!f() { test "$1" = get || exit 0; test -n "$GH_TOKEN" || exit 1; printf 'username=x-access-token\\npassword=%s\\n' "$GH_TOKEN"; }; f`;
 
-export function gitEnvironment(signingKey?: string, base: NodeJS.ProcessEnv = process.env, credentials: "controller" | "worker" = "controller"): NodeJS.ProcessEnv {
+export function gitEnvironment(signingKey?: string, base: NodeJS.ProcessEnv = process.env, credentials: "controller" | "worker" = "controller", extra: [string, string][] = []): NodeJS.ProcessEnv {
   const env = { ...base };
   const entries: [string, string][] = [
     ["url.https://github.com/.insteadOf", "git@github.com:"],
@@ -10,6 +10,7 @@ export function gitEnvironment(signingKey?: string, base: NodeJS.ProcessEnv = pr
     ["credential.https://github.com.helper", ""],
     ["credential.https://github.com.helper", credentials === "worker" ? workerCredentialHelper : "!gh auth git-credential"],
     ["credential.interactive", "false"],
+    ...extra,
   ];
   if (signingKey) entries.push(
     ["gpg.format", "ssh"], ["gpg.ssh.program", "/usr/bin/ssh-keygen"],

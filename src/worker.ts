@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { CodexRPC, type RPCMessage } from "./codex-rpc";
 import { addUsage, emptyUsage } from "./usage";
@@ -7,9 +7,13 @@ import type { ModelPrice, Run, Usage } from "./model";
 import { Store } from "./store";
 import { localDay } from "./usage";
 import { gitShellSettings } from "./git-environment";
+import { readWorkerToken, workerEnvironment } from "./worker-credentials";
+import { pendingRequests } from "./sessions";
 
 export type WorkerState = Run & { status: "working" | "done" | "blocked" | "error"; activeTurn?: string; pid?: number };
-export type WorkerConfig = { id: string; number: number; checkout: string; directory: string; resultDirectory: string; model: string; price: ModelPrice; prices: { [id: string]: ModelPrice }; budgetUSD: number; startedAt: string; prompt: string; dbPath?: string; dailyCapUSD?: number; gitSigningKey?: string; purpose?: "triage" | "repair"; resumeThreadId?: string; resumeQueued?: boolean; recoverRun?: boolean };
+export type WorkerConfig = { id: string; number: number; checkout: string; directory: string; resultDirectory: string; model: string; price: ModelPrice; prices: { [id: string]: ModelPrice }; budgetUSD: number; startedAt: string; prompt: string; dbPath?: string; dailyCapUSD?: number; gitSigningKey?: string; purpose?: "triage" | "repair"; resumeThreadId?: string; resumeQueued?: boolean; recoverRun?: boolean;
+  // Isolated jobs: where the worker may write, where the owner's answers arrive, and today's spend by other runs.
+  stateDirectory?: string; approvalsDirectory?: string; spendPath?: string };
 
 export class Worker {
   rpc: CodexRPC;
@@ -31,7 +35,7 @@ export class Worker {
     this.state.updatedAt = new Date().toISOString();
     const data = JSON.stringify(this.state);
     this.writes = this.writes.then(async () => {
-      const path = join(this.config.directory, "runtime.json");
+      const path = join(this.config.stateDirectory ?? this.config.directory, "runtime.json");
       await Bun.write(`${path}.tmp`, data); renameSync(`${path}.tmp`, path);
       this.store?.saveRun(JSON.parse(data));
     });
@@ -43,7 +47,7 @@ export class Worker {
   }
   async start(): Promise<void> {
     if (this.config.resumeThreadId || this.config.recoverRun) {
-      const prior: WorkerState = await Bun.file(join(this.config.directory, "runtime.json")).json();
+      const prior: WorkerState = await Bun.file(join(this.config.stateDirectory ?? this.config.directory, "runtime.json")).json();
       if (prior.id !== this.config.id || prior.threadId !== this.config.resumeThreadId) throw new Error("Run identity changed before resuming");
       this.state = { ...prior, budgetUSD: this.config.budgetUSD, state: "running", status: "working", prompt: undefined, activeTurn: undefined, endedAt: undefined };
       if (this.state.costUSD === null || this.state.costUSD >= this.config.budgetUSD) { await this.cap(); return; }
@@ -99,7 +103,8 @@ export class Worker {
       if (total.totalTokens > prior) this.state.turns++;
       await this.persist();
       if (this.state.costUSD === null || this.state.costUSD >= this.config.budgetUSD) await this.cap();
-      if (this.store && this.config.dailyCapUSD !== undefined && this.store.spent(localDay()) >= this.config.dailyCapUSD) await this.cap("Daily spend cap reached. Review Spend settings before continuing.");
+      const spent = await this.spentToday();
+      if (spent !== undefined && this.config.dailyCapUSD !== undefined && spent >= this.config.dailyCapUSD) await this.cap("Daily spend cap reached. Review Spend settings before continuing.");
     } else if (message.method === "model/rerouted") {
       this.state.model = p.toModel;
       if (!this.config.prices[p.toModel]) await this.cap("The run switched to a model without configured pricing.");
@@ -128,6 +133,14 @@ export class Worker {
       console.log(`\n\n${this.state.summary}`);
       await this.persist();
     }
+  }
+  async spentToday(): Promise<number | undefined> {
+    if (this.store) return this.store.spent(localDay());
+    if (!this.config.spendPath) return undefined;
+    const day = localDay();
+    let others = 0;
+    try { const shared = await Bun.file(this.config.spendPath).json(); if (shared.day === day && Number.isFinite(shared.othersUSD)) others = shared.othersUSD; } catch {}
+    return others + (this.state.costsByDay?.[day] ?? 0);
   }
   async cap(reason = "Run spend cap reached. Review the limit before starting another run."): Promise<void> {
     if (this.capped) return;
@@ -168,30 +181,57 @@ export class Worker {
   }
 }
 
-async function main(): Promise<void> {
-  const config: WorkerConfig = await Bun.file(process.argv[2]).json();
-  const worker = new Worker(config);
-  const control = join(config.directory, "control"); mkdirSync(control, { recursive: true, mode: 0o700 });
+// Reads requests from a directory. Under herdr the worker owns it and deletes each request. An isolated
+// worker cannot write the controller's directories, so it acknowledges in its own state directory instead.
+function watchRequests(directory: string, acks: string | undefined, handle: (message: any) => Promise<void>): void {
+  // With default ACLs a new directory's group bits become its ACL mask, so 0o750 is what lets the controller read acks.
+  if (acks) mkdirSync(acks, { recursive: true, mode: 0o750 }); else mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const handled = new Set<string>();
   let processing = false;
   setInterval(async () => {
     if (processing) return; processing = true;
     try {
-      for (const file of readdirSync(control).filter(f => f.endsWith(".json")).sort()) {
-        const path = join(control, file);
-        const message = await Bun.file(path).json(); unlinkSync(path);
+      for (const file of pendingRequests(directory)) {
+        if (handled.has(file) || acks && existsSync(join(acks, `${file}.ack`))) continue;
+        const path = join(directory, file);
+        let message: any;
+        try { message = await Bun.file(path).json(); } catch { continue; }
+        handled.add(file); if (!acks) unlinkSync(path);
         let error: string | undefined;
-        try {
-          if (message.type === "reply") {
-            if (worker.state.prompt?.kind === "permission") throw new Error("Open the run in Terminal to respond to permission requests.");
-            await worker.input(message.message, message.promptId);
-          } else if (message.type === "interrupt") await worker.interrupt();
-          else throw new Error("Unknown run command");
-        } catch (e) { error = e instanceof Error ? e.message : String(e); }
-        await Bun.write(join(control, `${file}.ack`), JSON.stringify({ error }));
+        try { await handle(message); } catch (e) { error = e instanceof Error ? e.message : String(e); }
+        await Bun.write(join(acks ?? directory, `${file}.ack`), JSON.stringify({ error }));
       }
     } finally { processing = false; }
   }, 100);
-  createInterface({ input: process.stdin }).on("line", text => { void worker.input(text).catch(error => console.error(error.message)); });
+}
+
+// An isolated job's unit hands the worker its read-only GitHub token as a systemd credential.
+function useWorkerToken(config: WorkerConfig): void {
+  const credential = process.env.CREDENTIALS_DIRECTORY && join(process.env.CREDENTIALS_DIRECTORY, "github-token");
+  if (!credential || !existsSync(credential)) return;
+  const github = join(config.stateDirectory ?? config.directory, "github");
+  rmSync(github, { recursive: true, force: true }); mkdirSync(github, { recursive: true, mode: 0o700 });
+  const env = workerEnvironment(process.env, readWorkerToken(credential, false), github);
+  for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+  Object.assign(process.env, env);
+}
+
+async function main(): Promise<void> {
+  const config: WorkerConfig = await Bun.file(process.argv[2]).json();
+  useWorkerToken(config);
+  const worker = new Worker(config);
+  const state = config.stateDirectory;
+  watchRequests(join(config.directory, "control"), state && join(state, "control"), async message => {
+    if (message.type === "reply") {
+      if (worker.state.prompt?.kind === "permission") throw new Error(state ? "Answer permission requests with woodshed-respond on the controller host." : "Open the run in Terminal to respond to permission requests.");
+      await worker.input(message.message, message.promptId);
+    } else if (message.type === "interrupt") await worker.interrupt();
+    else throw new Error("Unknown run command");
+  });
+  // Only woodshed-respond, run by the owner over SSH, can write here. The agent runs as a user that cannot,
+  // so it cannot approve its own permission requests.
+  if (state && config.approvalsDirectory) watchRequests(config.approvalsDirectory, join(state, "approvals"), message => worker.input(String(message.answer), String(message.promptId)));
+  else createInterface({ input: process.stdin }).on("line", text => { void worker.input(text).catch(error => console.error(error.message)); });
   process.on("SIGTERM", () => { worker.rpc.close(); process.exit(0); });
   process.on("SIGHUP", () => { worker.rpc.close(); process.exit(0); });
   process.on("SIGINT", () => { void worker.interrupt(); });

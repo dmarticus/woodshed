@@ -10,7 +10,7 @@ export const playbookCatalog = [
 ];
 
 export type RepairHint = { source_pr: number; run: string; published_head: string; summary: string; files: string[] };
-export type PublishedResult = { publishedHead?: string; playbook?: string; repair?: { files: string[]; reason: string } };
+export type PublishedResult = { publishedHead?: string; playbook?: string; repair?: { files: string[]; reason: string }; replies?: import("./replies").ThreadReply[] };
 
 export class Playbooks {
   constructor(readonly store: Store) {}

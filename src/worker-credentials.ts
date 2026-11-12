@@ -8,10 +8,11 @@ export class WorkerCredentialError extends Error {}
 // Anything that could let a worker reach the controller's GitHub login instead of the worker token.
 const inheritedCredentials = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"];
 
-export function readWorkerToken(path: string): string {
+// `private` is false for a systemd credential: systemd makes it readable only by the one unit, with its own mode.
+export function readWorkerToken(path: string, private_ = true): string {
   let token: string;
   try {
-    if (statSync(path).mode & 0o077) throw new WorkerCredentialError(`The worker GitHub token at ${path} must be readable only by its owner (mode 0600)`);
+    if (private_ && statSync(path).mode & 0o077) throw new WorkerCredentialError(`The worker GitHub token at ${path} must be readable only by its owner (mode 0600)`);
     token = readFileSync(path, "utf8").trim();
   } catch (error) {
     if (error instanceof WorkerCredentialError) throw error;

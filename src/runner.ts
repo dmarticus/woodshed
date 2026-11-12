@@ -1,15 +1,15 @@
 import { mergedDecisionContext, type DecisionView } from "./merged-decisions";
 import { GitHub } from "./github";
 import { activeQueuePhase } from "./merge-queue";
-import { mkdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { command } from "./command";
 import { BranchUpdate, SupersededUpdate } from "./branch-update";
 import { Models } from "./models";
 import type { Config, Job, Run, Snapshot, JobObservation, AssessmentResult } from "./model";
-import type { WorkerState } from "./worker";
-import { publishedPrices } from "./usage";
+import type { WorkerConfig, WorkerState } from "./worker";
+import { localDay, publishedPrices } from "./usage";
 import { Publisher } from "./publish";
 import { ciEvidenceContext, routeWithCIEvidence } from "./check-evidence";
 import { parseAssessment, triagePrompt } from "./triage";
@@ -17,6 +17,9 @@ import { missingSession, temporaryFailure } from "./recovery";
 import { handoffContext } from "./handoff";
 import { repairContext, type PublishedResult } from "./playbooks";
 import { readWorkerToken, workerCommand } from "./worker-credentials";
+import { HerdrSessions, SystemdSessions, isolationProblem, readUntrustedJSON, untrustedExists, type Sessions, type Terminal } from "./sessions";
+import { isolateJobGit } from "./job-git";
+import { parseReplies } from "./replies";
 
 export class Runner {
   models: Models;
@@ -38,6 +41,7 @@ export class Runner {
     return `The exact proposed file manifest has additional merged-tradeoff evidence that was not supplied before this repair. Review it and reconsider the saved edits before publication. Preserve unrelated work. Return the complete exact file manifest again, including preserved intended edits. Do not publish or expand scope.\n${mergedDecisionContext(unseen, context.omitted_records)}`;
   }
   readonly exec: typeof command;
+  readonly sessions: Sessions;
   // herdr can stay up while every command fails (its registry writer stops when the disk fills), so count consecutive failures.
   readonly herdr: { consecutiveFailures: number; failingSince?: string; lastError?: string } = { consecutiveFailures: 0 };
   constructor(readonly config: Config, readonly dataDir: string, exec: typeof command = command) {
@@ -51,15 +55,28 @@ export class Runner {
         throw error;
       }
     };
+    if (config.jobIsolation === "systemd") {
+      this.sessions = new SystemdSessions(dataDir, this.exec);
+      mkdirSync(join(dataDir, "jobs"), { recursive: true, mode: 0o700 });
+      isolateJobGit(dataDir, config.checkout ? [join(config.checkout, ".git")] : []);
+    } else this.sessions = new HerdrSessions(this.exec);
   }
+  get isolated(): boolean { return this.sessions.kind === "systemd"; }
+  private jobDirectory(job: Job): string { return join(this.dataDir, "jobs", job.name); }
   private async guardMergeQueue(current: Snapshot): Promise<void> {
     if (!current.mergeQueue) return;
     const queue = await new GitHub(this.config, this.exec).mergeQueue(current);
     if (!queue || queue.error || queue.state === "unknown" || activeQueuePhase(queue.state)) throw Error("PR is in the merge queue or its queue status could not be confirmed. Saved edits are retained; no publication was attempted.");
   }
-  private checkWorkerToken(): void { if (this.config.workerGitHubTokenPath) readWorkerToken(this.config.workerGitHubTokenPath); }
-  private startWorker(job: Job, cwd: string, argv: string[]): Promise<string> {
-    return this.exec(["hc", "run", "--json", "--bg", "--no-parent", "--name", job.name, "--cwd", cwd, ...workerCommand(this.config, join(this.dataDir, "jobs", job.name), argv)], { timeout: 90_000 });
+  private checkWorkerToken(): void {
+    if (this.config.workerGitHubTokenPath) readWorkerToken(this.config.workerGitHubTokenPath);
+    const isolation = this.isolated ? isolationProblem(this.dataDir, this.config.workerGitHubTokenPath) : undefined;
+    if (isolation) throw new Error(isolation);
+  }
+  private startWorker(job: Job, cwd: string, argv: string[]): Promise<void> {
+    // An isolated job's unit loads the worker token itself; under herdr a launcher swaps it in.
+    if (this.sessions.kind === "systemd") return this.sessions.run(job.name, cwd, argv);
+    return this.sessions.run(job.name, cwd, workerCommand(this.config, join(this.dataDir, "jobs", job.name), argv));
   }
   async launch(pr: Snapshot, job: Job): Promise<void> {
     this.checkWorkerToken();
@@ -85,6 +102,8 @@ export class Runner {
     const checkout = join(directory, "checkout");
     const resultDirectory = join(directory, "agent-result");
     mkdirSync(directory, { recursive: true, mode: 0o700 });
+    // Files Git creates below inherit the agent's access, so this comes before the checkout exists.
+    if (this.sessions instanceof SystemdSessions) await this.sessions.isolate(directory);
     mkdirSync(resultDirectory, { recursive: true, mode: 0o700 });
     const headRef = `refs/woodshed/${job.name}/head`;
     let repository = this.config.checkout;
@@ -141,9 +160,10 @@ Address real defects and human feedback with judgment. Batch related fixes. Do n
 Start with the attached head-bound GitHub check summaries and annotations; fetch their current API output when needed, even when detailsUrl points to an external CI provider. Use the named test and assertion to inspect the code and reproduce the failure locally. Full external-provider logs are optional when GitHub and the checkout provide enough evidence. A provider sign-in redirect is not proof that diagnosis or repair requires credentials. Read additional failing-job logs when they are available. A failure in an edited file is evidence to investigate, not proof of causality.
 Do not approve visual baselines. Stop for visual inspection, product decisions, credentials that are actually required after available diagnostics and local investigation are exhausted, or uncertain human requests.
 Only ask the owner about a verified actionable blocker. Non-blocking CI report warnings, advisory bundle-size deltas, successful visual statuses, and already-quarantined visual differences are not reasons to request a decision. The owner has explicitly asked to keep those out of Needs you. Cancelled jobs replaced by a newer workflow run are historical evidence, not current repair work.
-Reply only in review threads when needed, ending each reply with 'via Woodshed'. No top-level PR comments.
-Do not resolve a human's thread unless the requested fix is unambiguous and verified. React to PostHog Review findings per repository policy.
-${this.config.workerGitHubTokenPath ? "Your GitHub token is read-only, so you cannot reply to, react to, or resolve review threads. Put any reply a reviewer still needs in your result reason.\n" : ""}Use the repository's permitted publishing tools and hooks. Never bypass hooks or force-push.
+${this.config.workerGitHubTokenPath ? `Your GitHub token is read-only. To reply in a review thread, add the reply to your result as "replies":[{"thread":"<review thread id from the evidence below>","body":"your reply","resolve":false}]. Woodshed posts each one, ending it with 'via Woodshed', after it publishes your change. No top-level PR comments.
+Set resolve only for a thread whose requested fix is unambiguous and verified.` : `Reply only in review threads when needed, ending each reply with 'via Woodshed'. No top-level PR comments.
+Do not resolve a human's thread unless the requested fix is unambiguous and verified. React to PostHog Review findings per repository policy.`}
+${this.isolated ? "Woodshed commits your declared files without running the repository's Git hooks. Before writing your result, run the formatters and linters the repository's pre-commit hook would run on your changed files. Never force-push." : "Use the repository's permitted publishing tools and hooks. Never bypass hooks or force-push."}
 Woodshed checks the live PR target and remote head before publication. Prefer gh API reads for current PR state; you do not need to fetch Git refs merely to inspect reviews or CI.
 Do not stage, commit, or push changes yourself. Woodshed's controller owns signing and publishing after validating the current PR head and the exact changed file set. Leave all intended changes in this worktree.
 This is one bounded repair attempt. Verify one coherent increment and return its declared files, then stop; the controller owns publication, CI waiting, and subsequent attempts.
@@ -164,6 +184,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     const directory = join(this.dataDir, "jobs", job.name);
     const checkout = join(directory, "checkout");
     const results = join(directory, "agent-result");
+    if (this.sessions instanceof SystemdSessions) await this.sessions.isolate(directory);
     mkdirSync(checkout, { recursive: true, mode: 0o700 });
     mkdirSync(results, { recursive: true, mode: 0o700 });
     const prompt = triagePrompt(this.config.repository, pr, report, join(results, "result.json")) + ciEvidenceContext(job.ciEvidence);
@@ -180,7 +201,8 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     const run = await this.runtime(job);
     if (run?.costUSD === null || (run?.costUSD ?? 0) >= config.budgetUSD) throw new Error("The original run cannot resume within its budget");
     await this.stop(job);
-    try { await this.exec(["hc", "rm", job.name]); } catch (error) { if (!missingSession(error)) throw error; }
+    try { await this.sessions.remove(job.name); } catch (error) { if (!missingSession(error)) throw error; }
+    if (existsSync(join(directory, "failure.json"))) unlinkSync(join(directory, "failure.json"));
     if (job.decisionContextAfterTurn !== undefined) {
       // A completed follow-up must provide a fresh publication manifest.
       for (const result of [join(directory, "agent-result", "result.json"), join(directory, "result.json")])
@@ -200,7 +222,14 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       job.model = model.id; job.adapter = "app-server";
       const directory = join(this.dataDir, "jobs", job.name);
       const path = join(directory, "worker.json");
-      await Bun.write(`${path}.tmp`, JSON.stringify({ id: job.name, number, checkout, directory, resultDirectory, model: model.id, price: model.price, prices: { ...publishedPrices, ...this.config.modelPrices }, budgetUSD: job.budgetUSD ?? this.config.runCapUSD ?? 5, dailyCapUSD: this.config.dailyCapUSD ?? 20, gitSigningKey: this.config.gitSigningKey, purpose: job.kind === "triage" ? "triage" : "repair", startedAt: job.startedAt, prompt, dbPath: join(this.dataDir, "state.sqlite") }));
+      const common = { id: job.name, number, checkout, directory, resultDirectory, model: model.id, price: model.price, prices: { ...publishedPrices, ...this.config.modelPrices }, budgetUSD: job.budgetUSD ?? this.config.runCapUSD ?? 5, dailyCapUSD: this.config.dailyCapUSD ?? 20, purpose: job.kind === "triage" ? "triage" as const : "repair" as const, startedAt: job.startedAt, prompt };
+      // An isolated agent cannot write the controller's database; it reports through its own state directory
+      // and reads today's spend from a file the controller keeps current.
+      const config: WorkerConfig = this.isolated
+        ? { ...common, stateDirectory: join(directory, "worker"), approvalsDirectory: join(directory, "approvals"), spendPath: join(directory, "spend.json") }
+        : { ...common, gitSigningKey: this.config.gitSigningKey, dbPath: join(this.dataDir, "state.sqlite") };
+      if (this.isolated) await this.shareSpend(job, 0);
+      await Bun.write(`${path}.tmp`, JSON.stringify(config));
       renameSync(`${path}.tmp`, path);
       await this.startWorker(job, checkout, [process.execPath, join(import.meta.dir, "worker.ts"), path]);
       return;
@@ -216,13 +245,13 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     if (job.kind === "triage") {
       const run = await this.runtime(job);
       if (!run || run.status === "working") {
-        const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+        const terminal = await this.sessions.get(job.name);
         if (terminal.state === "finished" || Date.now() - Date.parse(job.startedAt) > 15 * 60_000) return { state: "human", reason: "GitHub investigation stopped before returning a verified result" };
         return { state: "working" };
       }
       if (run.status !== "done") return { state: "human", reason: run.summary };
       try {
-        const assessment = routeWithCIEvidence(parseAssessment(await Bun.file(await this.resultPath(job)).json(), job.head, current?.head === job.head ? current.threads : undefined, this.config.repository, current?.head === job.head ? current.checks : undefined), job.ciEvidence);
+        const assessment = routeWithCIEvidence(parseAssessment(readUntrustedJSON(await this.resultPath(job)), job.head, current?.head === job.head ? current.threads : undefined, this.config.repository, current?.head === job.head ? current.checks : undefined), job.ciEvidence);
         await this.stop(job);
         return { state: "triaged", assessment };
       } catch (error) { return { state: "human", reason: String(error) }; }
@@ -231,7 +260,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     if (job.adapter === "app-server") {
       const run = await this.runtime(job);
       if (!run) {
-        const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+        const terminal = await this.sessions.get(job.name);
         if (terminal.state === "finished" || Date.now() - Date.parse(job.startedAt) > 60_000) return { state: "human", reason: "The run did not report its startup state. Inspect its terminal before retrying." };
         return { state: "working" };
       }
@@ -239,15 +268,15 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       if (run.status !== "done") return { state: "working" };
       if (job.decisionContextAfterTurn !== undefined && run.turns <= job.decisionContextAfterTurn) return { state: "working" };
       job.decisionContextAfterTurn = undefined; job.contextReview = false;
-      const resultFile = Bun.file(await this.resultPath(job));
-      if (!await resultFile.exists()) return { state: "human", reason: "The agent completed without a structured repair result. Inspect the saved work before retrying." };
-      const result = await resultFile.json();
+      const resultPath = await this.resultPath(job);
+      if (!untrustedExists(resultPath)) return { state: "human", reason: "The agent completed without a structured repair result. Inspect the saved work before retrying." };
+      const result = readUntrustedJSON(resultPath);
       if (result.outcome === "ready_to_publish" || result.outcome === "no_change") {
         const directory = join(this.dataDir, "jobs", job.name);
         const publisher = new Publisher(join(directory, "checkout"), directory, this.config.repository);
         if (!(await publisher.changedFiles()).length && !await Bun.file(join(directory, "repair-publish.json")).exists()) {
           await this.stop(job);
-          return { state: "completed", reason: result.reason ?? "No repository changes needed" };
+          return { state: "completed", reason: result.reason ?? "No repository changes needed", replies: parseReplies(result.replies, current?.threads ?? []) };
         }
         if (result.outcome === "no_change") return { state: "human", reason: "The run reported no change but its checkout has edits. Verify and declare the intended files before publishing." };
         if (current?.head === job.head && current.state === "OPEN" && !current.draft && result.outcome === "ready_to_publish" && Array.isArray(result.files) && result.files.every((p: unknown) => typeof p === "string")) {
@@ -263,7 +292,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
           const live = { ...current, head: target.headRefOid, branch: target.headRefName, base: target.baseRefName, state: target.state, draft: target.isDraft };
           const directory = join(this.dataDir, "jobs", job.name);
           const commit = await new Publisher(join(directory, "checkout"), directory, this.config.repository).publish(job.head, live, result.files);
-          return { state: "published", publishedHead: commit, repair: { files: result.files, reason: result.reason ?? "Verified scoped repair" }, reason: `Published signed repair ${commit.slice(0, 8)}; waiting for fresh CI and review. ${result.reason ?? ""}` };
+          return { state: "published", publishedHead: commit, replies: parseReplies(result.replies, current.threads), repair: { files: result.files, reason: result.reason ?? "Verified scoped repair" }, reason: `Published signed repair ${commit.slice(0, 8)}; waiting for fresh CI and review. ${result.reason ?? ""}` };
         } catch (error) {
           return { state: error instanceof SupersededUpdate ? "superseded" : "human", reason: `Could not publish repair: ${error instanceof Error ? error.message : error}` };
         }
@@ -271,7 +300,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       if (result.outcome === "published" || result.outcome === "superseded") { await this.stop(job); return { state: result.outcome, reason: result.reason }; }
       return { state: "human", reason: result.reason ?? "Run needs your input" };
     }
-    const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+    const terminal = await this.sessions.get(job.name);
     const state = terminal.status?.state;
     if (state === "error" || state === "blocked" && terminal.status?.kind !== "question") return { state: "human", reason: terminal.status?.msg || "Open the agent session to respond to its permission or login prompt." };
     if (job.afterTurn !== undefined && terminal.state !== "finished" && (terminal.turn ?? 0) <= job.afterTurn)
@@ -279,8 +308,8 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     const path = await this.resultPath(job);
     if (state === "blocked" || state === "error") return { state: "human", reason: terminal.status?.msg || "Attach to the coding session to answer its question or permission request." };
     if (state === "done" || state === "idle" && terminal.turn > 0 || terminal.state === "finished") {
-      if (!await Bun.file(path).exists()) return { state: "human", reason: "Agent stopped without a structured result. Inspect its terminal before retrying." };
-      const result = await Bun.file(path).json();
+      if (!untrustedExists(path)) return { state: "human", reason: "Agent stopped without a structured result. Inspect its terminal before retrying." };
+      const result = readUntrustedJSON(path);
       if (result.outcome === "superseded") return { state: "superseded", reason: typeof result.reason === "string" ? result.reason : "A branch-update job is needed." };
       if (result.outcome === "published" && typeof result.reason === "string") return { state: "published", reason: result.reason };
       return { state: "human", reason: typeof result.reason === "string" ? result.reason.slice(0, 2000) : "Agent needs your input." };
@@ -300,7 +329,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
         if (job.adapter === "app-server") {
           const run = await this.runtime(job);
           if (!run) {
-            const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+            const terminal = await this.sessions.get(job.name);
             if (terminal.state === "finished" || Date.now() - Date.parse(job.startedAt) > 60_000) return { state: "human", reason: "The conflict run did not report its startup state. Inspect its terminal before retrying." };
             return { state: "working" };
           }
@@ -310,11 +339,11 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
           if (run.status === "working") return { state: "working" };
           if (run.status === "blocked" || run.status === "error") return { state: "human", reason: run.summary };
         }
-        const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+        const terminal = await this.sessions.get(job.name);
         if (current.head !== job.head || current.base !== plan.baseBranch || current.state !== "OPEN" || current.draft) {
           const localHead = (await this.exec(["git", "rev-parse", "HEAD"], { cwd: update.checkout })).trim();
           if (current.head !== localHead || current.base !== plan.baseBranch || current.state !== "OPEN" || current.draft) {
-            if (terminal.state === "live") await this.exec(["hc", "kill", job.name]);
+            if (terminal.state === "live") await this.sessions.kill(job.name);
             throw new SupersededUpdate("PR changed while resolving conflicts. The newer branch is preserved; refreshing the plan.");
           }
         }
@@ -328,9 +357,9 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
           if (Date.now() - Date.parse(job.startedAt) > 45 * 60_000) return { state: "human", reason: "Conflict resolution has run for 45 minutes. Inspect the session before continuing." };
           return { state: "working" };
         }
-        const result = await Bun.file(await this.resultPath(job)).json();
+        const result = readUntrustedJSON(await this.resultPath(job));
         if (result.outcome !== "resolved") return { state: "human", reason: typeof result.reason === "string" ? result.reason.slice(0, 2000) : "Agent stopped without a verified conflict resolution." };
-        if (terminal.state === "live") await this.exec(["hc", "kill", job.name]);
+        if (terminal.state === "live") await this.sessions.kill(job.name);
       }
       await update.allowAdjacentResolution(plan);
       if (plan.conflicts.length) {
@@ -351,7 +380,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     if (job.kind !== "branch-update" || job.head !== current.head || current.state !== "OPEN" || current.draft) return false;
     const run = await this.runtime(job);
     if (run?.status !== "done") return false;
-    const result = await Bun.file(await this.resultPath(job)).json();
+    const result = readUntrustedJSON(await this.resultPath(job));
     if (result.outcome !== "resolved") return false;
     const directory = join(this.dataDir, "jobs", job.name);
     const update = new BranchUpdate(join(directory, "checkout"), directory, this.config.repository);
@@ -366,10 +395,9 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       const state = await preparation.json();
       return { name: job.name, state: state.state, kind: null, message: state.summary, output: state.output };
     }
-    let raw: string; let output: string;
-    try { [raw, output] = await Promise.all([this.exec(["hc", "get", "--json", job.name]), this.exec(["hc", "read", "--lines", "80", job.name])]); }
+    let terminal: Terminal; let output: string;
+    try { [terminal, output] = await Promise.all([this.sessions.get(job.name), this.sessions.read(job.name, 80)]); }
     catch (error) { if (!missingSession(error)) throw error; return { name: job.name, state: "recovering", kind: null, message: "Reconnecting the saved run", output: "" }; }
-    const terminal = JSON.parse(raw);
     if (job.adapter === "app-server") {
       const run = await this.runtime(job);
       if (run) return { name: job.name, state: run.status, kind: run.prompt?.kind ?? null, message: run.prompt?.text ?? run.summary, output: output.slice(-32000), promptId: run.prompt?.id };
@@ -386,7 +414,7 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
       await this.control(job, { type: "reply", message, promptId });
       return 0;
     }
-    const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+    const terminal = await this.sessions.get(job.name);
     if (terminal.state === "finished") throw new Error("This agent session has ended. Start a new repair instead.");
     if (terminal.status?.state === "blocked" && terminal.status?.kind !== "question") throw new Error("This session needs a permission or login response. Open the agent session to continue.");
     const path = await this.resultPath(job);
@@ -395,21 +423,18 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     const target = join(directory, "agent-result", "result.json");
     mkdirSync(join(directory, "agent-result"), { recursive: true, mode: 0o700 });
     const text = `Owner reply for this PR:\n${message}\nContinue within the original task scope. Update your structured result at ${target} as your last task operation.`;
-    const argv = ["hc", "send", "--json"];
-    if (terminal.status?.state === "blocked") argv.push("--force");
-    argv.push(job.name, text);
-    await this.exec(argv);
+    await this.sessions.send(job.name, text, terminal.status?.state === "blocked");
     return terminal.turn ?? 0;
   }
   async interrupt(job: Job): Promise<void> {
     if (job.adapter === "app-server") await this.control(job, { type: "interrupt" });
-    else await this.exec(["hc", "interrupt", job.name]);
+    else await this.sessions.interrupt(job.name);
   }
   async stop(job: Job): Promise<void> {
     let terminal;
-    try { terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name])); }
+    try { terminal = await this.sessions.get(job.name); }
     catch (error) { if (missingSession(error)) return; throw error; }
-    if (terminal.state === "live") { try { await this.exec(["hc", "kill", job.name]); } catch (error) { if (!missingSession(error)) throw error; } }
+    if (terminal.state === "live") { try { await this.sessions.kill(job.name); } catch (error) { if (!missingSession(error)) throw error; } }
   }
   async health(job: Job): Promise<{ state: "live" | "missing" | "finished" | "complete"; started: boolean }> {
     const directory = join(this.dataDir, "jobs", job.name);
@@ -418,27 +443,39 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     if (configured) { const config = await worker.json(); job.adapter = "app-server"; if (typeof config.model === "string") job.model = config.model; }
     const started = configured || this.config.workerProtocol !== "app-server" && await Bun.file(join(directory, "prompt.txt")).exists();
     const run = await this.runtime(job);
-    if (run?.status === "done" && await Bun.file(await this.resultPath(job)).exists()) return { state: "complete", started };
+    if (run?.status === "done" && untrustedExists(await this.resultPath(job))) return { state: "complete", started };
     const plan = Bun.file(join(directory, "branch-update.json"));
     if (job.kind === "branch-update" && await plan.exists() && !(await plan.json()).conflicts.length) { job.model = "No model"; return { state: "complete", started: false }; }
     let terminal;
-    try { terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name])); }
+    try { terminal = await this.sessions.get(job.name); }
     catch (error) {
       if (!missingSession(error)) throw error;
-      if (run?.pid) {
+      if (run?.pid && !this.isolated) {
         try { process.kill(run.pid, 0); throw new Error("Worker unavailable through hc but still running; waiting to reconnect"); }
         catch (probe) { if ((probe as NodeJS.ErrnoException).code !== "ESRCH") throw probe; }
       }
       return { state: "missing", started };
     }
+    // A run its unit killed (out of memory) cannot report that itself, so the controller records why.
+    if (terminal.state === "finished" && terminal.status?.state === "error" && run && run.status !== "done" && run.status !== "error") {
+      const path = join(directory, "failure.json");
+      await Bun.write(`${path}.tmp`, JSON.stringify({ summary: terminal.status.msg ?? "The run stopped unexpectedly", at: new Date().toISOString() })); renameSync(`${path}.tmp`, path);
+      return { state: "finished", started };
+    }
     if (run?.status === "error" && temporaryFailure(run.summary) || terminal.state === "finished" && run?.status !== "done") return { state: "finished", started };
     return { state: "live", started };
   }
   async runtime(job: Job): Promise<WorkerState | undefined> {
-    const path = join(this.dataDir, "jobs", job.name, "runtime.json");
-    if (!await Bun.file(path).exists()) return undefined;
-    const run = await Bun.file(path).json();
+    const isolated = join(this.jobDirectory(job), "worker", "runtime.json");
+    const path = untrustedExists(isolated) ? isolated : join(this.jobDirectory(job), "runtime.json");
+    if (!untrustedExists(path)) return undefined;
+    const run: WorkerState = readUntrustedJSON(path);
     if (run.id !== job.name) throw new Error("Run telemetry does not match the job");
+    const failure = join(this.jobDirectory(job), "failure.json");
+    if (run.status !== "done" && run.status !== "error" && existsSync(failure)) {
+      const { summary, at } = await Bun.file(failure).json();
+      return { ...run, status: "error", state: "failed", summary, endedAt: at, prompt: undefined };
+    }
     return run;
   }
   async telemetry(job: Job): Promise<WorkerState | undefined> {
@@ -449,28 +486,38 @@ Current evidence (verify it afresh): ${JSON.stringify({ checks: pr.checks, threa
     return undefined;
   }
   async observe(job: Job): Promise<JobObservation> {
-    const terminal = JSON.parse(await this.exec(["hc", "get", "--json", job.name]));
+    const terminal = await this.sessions.get(job.name);
     if (job.adapter === "app-server") {
       const run = await this.runtime(job);
       if (!run) return { state: "unknown", summary: "Run has not reported its state" };
       return { state: terminal.state === "finished" && run.status === "working" ? "error" : run.status, summary: run.summary, promptId: run.prompt?.id };
     }
     const state = terminal.status?.state;
-    return { state: state === "working" && terminal.state === "live" ? "working" : ["blocked", "error", "done"].includes(state) ? state : terminal.state === "finished" ? "done" : "unknown", summary: terminal.status?.msg ?? "", promptId: state === "blocked" ? String(terminal.turn ?? 0) : undefined };
+    return { state: state === "working" && terminal.state === "live" ? "working" : state === "blocked" || state === "error" || state === "done" ? state : terminal.state === "finished" ? "done" : "unknown", summary: terminal.status?.msg ?? "", promptId: state === "blocked" ? String(terminal.turn ?? 0) : undefined };
+  }
+  // Today's spend by other runs, so an isolated agent can stop at the daily cap without the controller's database.
+  async shareSpend(job: Job, othersUSD: number): Promise<void> {
+    if (!this.isolated) return;
+    const path = join(this.jobDirectory(job), "spend.json");
+    await Bun.write(`${path}.tmp`, JSON.stringify({ day: localDay(), othersUSD })); renameSync(`${path}.tmp`, path);
   }
   private async control(job: Job, message: { type: string; message?: string; promptId?: string }): Promise<void> {
     const directory = join(this.dataDir, "jobs", job.name, "control"); mkdirSync(directory, { recursive: true, mode: 0o700 });
     const id = randomUUID(); const path = join(directory, `${id}.json`);
     await Bun.write(`${path}.tmp`, JSON.stringify(message)); renameSync(`${path}.tmp`, path);
+    // An isolated worker cannot write the control directory, so it acknowledges in its own state directory.
+    const ack = this.isolated ? join(this.jobDirectory(job), "worker", "control", `${id}.json.ack`) : `${path}.ack`;
     const deadline = Date.now() + 8000;
-    while (Date.now() < deadline) {
-      if (await Bun.file(`${path}.ack`).exists()) {
-        const ack = await Bun.file(`${path}.ack`).json();
-        if (ack.error) throw new Error(ack.error);
-        return;
+    try {
+      while (Date.now() < deadline) {
+        if (untrustedExists(ack)) {
+          const { error } = readUntrustedJSON(ack);
+          if (error) throw new Error(String(error).slice(0, 500));
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    throw new Error("Could not confirm delivery. Inspect the run before sending again.");
+      throw new Error("Could not confirm delivery. Inspect the run before sending again.");
+    } finally { if (this.isolated && existsSync(path)) unlinkSync(path); }
   }
 }
