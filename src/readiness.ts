@@ -1,18 +1,11 @@
 import { createHash } from "node:crypto";
-import { decide, failed, type Config, type Decision, type Record, type Run, type Snapshot } from "./model";
-import { queueCheck } from "./merge-queue";
+import { decide, failed, type Config, type Decision, type Record, type Run } from "./model";
 import { stackBlock } from "./stack";
 
 /** Bounded codes for the reasons below, safe to send to analytics. */
 export type ReadinessBlocker = "stale_observation" | "checks_pending" | "mergeability_unknown" | "policy_waiting" | "needs_fix" | "needs_review" | "needs_approval" | "owner_decision" | "paused" | "closed" | "stacked_dependency" | "run_attached" | "recovery_pending" | "investigation_pending" | "refresh_failed";
 
-function policyBlocker(pr: Snapshot, policy: Decision): ReadinessBlocker {
-  if (policy.kind !== "waiting") return ({ ready: "policy_waiting", fix: "needs_fix", review: "needs_review", approval: "needs_approval", human: "owner_decision", paused: "paused", closed: "closed" } as const)[policy.kind];
-  const checks = pr.checks.filter(c => !queueCheck(c));
-  if (!checks.length || checks.some(c => c.status !== "COMPLETED" || !c.conclusion)) return "checks_pending";
-  if (pr.mergeable === "UNKNOWN" || pr.mergeStateStatus === "UNKNOWN") return "mergeability_unknown";
-  return "policy_waiting";
-}
+const policyBlockers: { [kind in Exclude<Decision["kind"], "ready">]: ReadinessBlocker } = { waiting: "policy_waiting", fix: "needs_fix", review: "needs_review", approval: "needs_approval", human: "owner_decision", paused: "paused", closed: "closed" };
 
 export function readiness(record: Record, config: Config, records: Record[], runs: Run[], now = Date.now()) {
   const pr = record.snapshot;
@@ -23,7 +16,7 @@ export function readiness(record: Record, config: Config, records: Record[], run
   const dependency = stackBlock(pr, records, true);
   const blocked: [ReadinessBlocker, string][] = [];
   if (!fresh) blocked.push(["stale_observation", "GitHub state needs a fresh check"]);
-  if (policy.kind !== "ready") blocked.push([policyBlocker(pr, policy), policy.reason]);
+  if (policy.kind !== "ready") blocked.push([policy.code ?? policyBlockers[policy.kind], policy.reason]);
   if (dependency) blocked.push(["stacked_dependency", dependency.reason]);
   if (record.job) blocked.push(["run_attached", "A maintenance run is still attached"]);
   if (record.decision.kind === "human") blocked.push(["owner_decision", record.decision.question ?? record.decision.reason]);
