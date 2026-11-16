@@ -62,3 +62,11 @@ test.each(["verified", "human", "human reply", "other bot", "missing marker", "c
   expect(mutations).toBe(scenario === "verified" ? 1 : 0);
   expect(result.resolved).toEqual(scenario === "verified" ? ["thread"] : []);
 });
+
+test("settled mergeability re-reads UNKNOWN and gives up when the head moves", async () => {
+  const replies = [{ headRefOid: "head", mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" }, { headRefOid: "head", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }];
+  const github = new GitHub({ repository: "example/project" } as Config, async () => JSON.stringify(replies.shift()));
+  expect(await github.settledMergeability(1, "head", 3, 0)).toEqual({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+  const moved = new GitHub({ repository: "example/project" } as Config, async () => JSON.stringify({ headRefOid: "other", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }));
+  expect(await moved.settledMergeability(1, "head", 3, 0)).toBeUndefined();
+});

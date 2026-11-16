@@ -60,6 +60,23 @@ test("an upper PR becomes ready after its tracked base merges", async () => {
   expect(readiness(store.get(42)!, config, store.all(), []).ready).toBe(true);
 });
 
+test("a ready PR re-reads transient UNKNOWN mergeability instead of dropping to waiting", async () => {
+  const store = new Store(":memory:"); store.put(record(snapshot()));
+  let settled: { mergeable: string; mergeStateStatus: string } | undefined = { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" };
+  const reads: string[] = [];
+  const github: any = { settledMergeability: async (_: number, head: string) => { reads.push(head); return settled; } };
+  const controller = new Controller(config, store, github, {} as any);
+  await controller.reconcile({ ...snapshot(), mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" });
+  expect(reads).toEqual([snapshot().head]);
+  expect(store.get(42)?.decision.kind).toBe("ready");
+  expect(store.get(42)?.snapshot.mergeStateStatus).toBe("CLEAN");
+  settled = undefined;
+  await controller.reconcile({ ...snapshot(), mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" });
+  expect(store.get(42)?.decision.reason).toBe("GitHub is calculating mergeability");
+  await controller.reconcile({ ...snapshot(), mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" });
+  expect(reads).toHaveLength(2);
+});
+
 test.each(["infrastructure", "code", "mixed"])("shared CI handles %s failures without hiding checks or retrying forever", async kind => {
   let now = Date.UTC(2026, 0, 1); const store = new Store(":memory:"); let reruns = 0; let launches = 0;
   const pr = snapshot(42); pr.checks[0].conclusion = "FAILURE";

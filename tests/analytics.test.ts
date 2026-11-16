@@ -164,3 +164,13 @@ test("pausing the global mode does not pretend an unresolved owner question was 
   expect(h.events().filter(e => e.event === "woodshed_attention_raised")).toHaveLength(1);
   expect(h.events().filter(e => e.event === "woodshed_attention_resolved")).toHaveLength(0);
 });
+
+test("losing ready status records a bounded reason without decision text", () => {
+  const h = harness(), pr = record();
+  pr.decision = { kind: "ready", reason: "Ready" }; h.store.put(pr);
+  pr.snapshot.mergeable = "UNKNOWN"; h.store.put(pr);
+  pr.snapshot.mergeable = "MERGEABLE"; h.store.put(pr);
+  pr.lastError = "SECRET ERROR"; h.store.put(pr);
+  const changes = h.events().filter(e => e.event === "woodshed_pr_state_changed").map(e => [e.properties.to_phase, e.properties.reason]);
+  expect(changes).toEqual([["ready", null], ["waiting", "mergeability_unknown"], ["ready", null], ["waiting", "refresh_failed"]]);
+});

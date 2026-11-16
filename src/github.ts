@@ -243,6 +243,15 @@ export class GitHub {
   canMaintainKnown(pr: Snapshot): boolean {
     return !!pr.author && !!this.viewerName && pr.author.toLowerCase() === this.viewerName.toLowerCase();
   }
+  /** GitHub reports UNKNOWN while it recomputes mergeability after the base moves. Re-read it briefly instead of waiting a whole poll. */
+  async settledMergeability(number: number, head: string, attempts = 3, delayMs = 2000): Promise<Pick<Snapshot, "mergeable" | "mergeStateStatus"> | undefined> {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      await Bun.sleep(delayMs);
+      const pr = JSON.parse(await this.request(["gh", "pr", "view", String(number), "--repo", this.config.repository, "--json", "headRefOid,mergeable,mergeStateStatus"]));
+      if (pr.headRefOid !== head) return undefined;
+      if (pr.mergeable !== "UNKNOWN" && pr.mergeStateStatus !== "UNKNOWN") return { mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus };
+    }
+  }
   async freshSnapshot(number: number): Promise<Snapshot> { this.primed.delete(number); return this.snapshot(number); }
   async snapshot(number: number): Promise<Snapshot> {
     const pr = this.primed.get(number) ?? JSON.parse(await this.request(["gh", "pr", "view", String(number), "--repo", this.config.repository, "--json", "number,title,url,headRefOid,headRefName,baseRefName,baseRefOid,state,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,author,body,updatedAt,reviewRequests"]));

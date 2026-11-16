@@ -38,7 +38,9 @@ export class ProductAnalytics {
       }
       const props = { ...this.properties(number), baseline: state.baseline };
       if (handoff) this.analytics.capture("woodshed_handoff_accepted", { ...props, source: "mcp" }, `handoff:${record.handoff!.id}`);
-      const phase = pr.state === "MERGED" ? "merged" : pr.state !== "OPEN" ? "closed" : record.watching === false ? "unwatched" : pr.draft ? "draft" : record.paused || modeOf(this.config) === "paused" && !record.job ? "paused" : record.decision.kind === "human" ? "needs_human" : record.recovery?.retryAt ? "recovering" : record.job ? ["preparing", "running"].includes(this.store.run(record.job.name)?.state ?? "preparing") ? this.store.run(record.job.name)?.state ?? "preparing" : "waiting" : record.decision.kind === "ready" && readiness(record, this.config, this.store.all(), [], this.now()).ready ? "ready" : "waiting";
+      let gate: ReturnType<typeof readiness> | undefined;
+      const gated = () => gate ??= readiness(record, this.config, this.store.all(), [], this.now());
+      const phase = pr.state === "MERGED" ? "merged" : pr.state !== "OPEN" ? "closed" : record.watching === false ? "unwatched" : pr.draft ? "draft" : record.paused || modeOf(this.config) === "paused" && !record.job ? "paused" : record.decision.kind === "human" ? "needs_human" : record.recovery?.retryAt ? "recovering" : record.job ? ["preparing", "running"].includes(this.store.run(record.job.name)?.state ?? "preparing") ? this.store.run(record.job.name)?.state ?? "preparing" : "waiting" : record.decision.kind === "ready" && gated().ready ? "ready" : "waiting";
       const decision = enrolled && record.decision.kind === "human" ? record.decision.id : undefined;
       if (state.decision && state.decision !== decision) {
         this.analytics.capture("woodshed_attention_resolved", { ...props, decision_id: this.analytics.id(`decision:${state.decision}`), duration_ms: Math.max(0, this.now() - (state.decisionAt ?? this.now())), resolution: this.actionContext?.action ?? (phase === "merged" || phase === "closed" ? phase : "state_changed"), source: this.actionContext?.source ?? "automatic" });
@@ -50,7 +52,7 @@ export class ProductAnalytics {
         state.decision = decision; state.decisionAt = this.now();
       }
       if (phase !== state.phase) {
-        this.analytics.capture("woodshed_pr_state_changed", { ...props, from_phase: state.phase, to_phase: phase, elapsed_ms: Math.max(0, this.now() - state.enrolledAt), human_decisions: state.decisions });
+        this.analytics.capture("woodshed_pr_state_changed", { ...props, from_phase: state.phase, to_phase: phase, reason: phase === "waiting" ? gated().blockers[0] ?? `decision_${record.decision.kind}` : null, elapsed_ms: Math.max(0, this.now() - state.enrolledAt), human_decisions: state.decisions });
         state.phase = phase;
       }
       if (phase === "ready") {
