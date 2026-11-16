@@ -12,6 +12,7 @@ export type Snapshot = {
 export type Decision = {
   kind: "paused" | "waiting" | "fix" | "review" | "approval" | "human" | "ready" | "closed";
   reason: string;
+  code?: "checks_pending" | "mergeability_unknown";
   response?: "reply" | "retry" | "recheck";
   action?: { label: string; url: string };
   title?: string;
@@ -147,9 +148,9 @@ export function decide(pr: Snapshot, record?: Record): Decision {
     ].filter(Boolean).join(" · ") };
   }
   if (pr.checks.length === 0 || pr.checks.some(c => c.status !== "COMPLETED" || !c.conclusion))
-    return { kind: "waiting", reason: "Waiting for checks to finish" };
+    return { kind: "waiting", code: "checks_pending", reason: "Waiting for checks to finish" };
   if (pr.mergeable === "UNKNOWN" || pr.mergeStateStatus === "UNKNOWN")
-    return { kind: "waiting", reason: "GitHub is calculating mergeability" };
+    return { kind: "waiting", code: "mergeability_unknown", reason: "GitHub is calculating mergeability" };
   if (pr.reviewDecision === "CHANGES_REQUESTED")
     return { kind: "human", reason: "Changes are still requested. A reviewer needs to confirm their feedback is addressed." };
 

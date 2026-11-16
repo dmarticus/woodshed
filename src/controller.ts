@@ -246,6 +246,8 @@ export class Controller {
     const previousHead = prior?.snapshot.head;
     const previousDecisionContext = prior?.decision.context;
     const record: Record = prior ?? { snapshot, decision: { kind: "waiting", reason: "Checking PR" }, paused: false, attempts: 0, fingerprint: "" };
+    if (previousKind === "ready" && previousHead === snapshot.head && (snapshot.mergeable === "UNKNOWN" || snapshot.mergeStateStatus === "UNKNOWN"))
+      Object.assign(snapshot, await this.github.settledMergeability?.(snapshot.number, snapshot.head).catch(() => undefined));
     // Upgrade already-visible verified escalations using their previous snapshot
     // before replacing it with fresh GitHub data. Raw worker reports aren't latched.
     const assessment = record.assessment;
